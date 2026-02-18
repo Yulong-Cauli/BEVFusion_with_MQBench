@@ -37,15 +37,14 @@ train_pipeline:
     pad_empty_sweeps: true
     remove_close: true
     load_augmented: ${load_augmented}
-  -
-    type: LoadRadarPointsMultiSweeps
-    load_dim: 18
-    sweeps_num: ${radar_sweeps}
-    use_dim: ${radar_use_dims}
-    max_num: ${radar_max_points}
-    compensate_velocity: ${radar_compensate_velocity}
-    filtering: ${radar_filtering}
-    normalize: ${radar_normalize}
+    # type: LoadRadarPointsMultiSweeps
+    # load_dim: 18
+    # sweeps_num: ${radar_sweeps}
+    # use_dim: ${radar_use_dims}
+    # max_num: ${radar_max_points}
+    # compensate_velocity: ${radar_compensate_velocity}
+    # filtering: ${radar_filtering}
+    # normalize: ${radar_normalize}
   -
     type: LoadAnnotations3D
     with_bbox_3d: true
@@ -139,7 +138,6 @@ train_pipeline:
     keys:
       - img
       - points
-      - radar
       - gt_bboxes_3d
       - gt_labels_3d
     meta_keys:
@@ -175,15 +173,14 @@ test_pipeline:
     pad_empty_sweeps: true
     remove_close: true
     load_augmented: ${load_augmented}
-  -
-    type: LoadRadarPointsMultiSweeps
-    load_dim: 18
-    sweeps_num: ${radar_sweeps}
-    use_dim: ${radar_use_dims}
-    max_num: ${radar_max_points}
-    compensate_velocity: ${radar_compensate_velocity}
-    filtering: ${radar_filtering}
-    normalize: ${radar_normalize}
+    # type: LoadRadarPointsMultiSweeps
+    # load_dim: 18
+    # sweeps_num: ${radar_sweeps}
+    # use_dim: ${radar_use_dims}
+    # max_num: ${radar_max_points}
+    # compensate_velocity: ${radar_compensate_velocity}
+    # filtering: ${radar_filtering}
+    # normalize: ${radar_normalize}
   -
     type: LoadAnnotations3D
     with_bbox_3d: true
@@ -218,7 +215,6 @@ test_pipeline:
     keys:
       - img
       - points
-      - radar
       - gt_bboxes_3d
       - gt_labels_3d
       #- gt_masks_bev

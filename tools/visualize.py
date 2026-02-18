@@ -2,6 +2,15 @@ import argparse
 import copy
 import os
 
+import numpy as np
+try:
+    np.long = int
+    np.int = int
+    np.float = float
+    np.bool = bool
+except:
+    pass
+
 import mmcv
 import numpy as np
 import torch

@@ -2,6 +2,14 @@ import argparse
 import copy
 import os
 import warnings
+import numpy as np
+try:
+    np.long = int
+    np.int = int
+    np.float = float
+    np.bool = bool
+except:
+    pass
 
 import mmcv
 import torch
@@ -112,10 +120,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    dist.init()
+    # dist.init()
 
     torch.backends.cudnn.benchmark = True
-    torch.cuda.set_device(dist.local_rank())
+    # torch.cuda.set_device(dist.local_rank())
 
     assert args.out or args.eval or args.format_only or args.show or args.show_dir, (
         "Please specify at least one operation (save/eval/format/show the "
@@ -159,7 +167,7 @@ def main():
                 ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
 
     # init distributed env first, since logger depends on the dist info.
-    distributed = True
+    distributed = False
 
     # set random seeds
     if args.seed is not None:
@@ -193,7 +201,7 @@ def main():
 
     if not distributed:
         model = MMDataParallel(model, device_ids=[0])
-        outputs = single_gpu_test(model, data_loader)
+        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
     else:
         model = MMDistributedDataParallel(
             model.cuda(),

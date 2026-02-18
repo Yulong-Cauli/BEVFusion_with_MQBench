@@ -226,6 +226,138 @@ class BEVFusion(Base3DFusionModel):
 
     #     return feats, coords, sizes
 
+    def show_results(self, data, result, out_dir, show=False, **kwargs):
+        """Results visualization.
+
+        Args:
+            data (dict): Input points and the information of the sample.
+            result (list[dict]): Prediction results.
+            out_dir (str): Output directory of visualization result.
+            show (bool, optional): Whether to visualize the results online.
+                Defaults to False.
+        """
+        import mmcv
+        from os import path as osp
+        import numpy as np
+        
+        # We need to adapt the visualization based on mmdet3d utils
+        # from mmdet3d.core import show_result
+        from mmdet3d.core.bbox import get_box_type
+
+        def show_result(
+            points,
+            gt_bboxes,
+            pred_result,
+            out_dir,
+            filename,
+            show=False,
+            snapshot=False,
+            pred_bboxes=None, 
+        ):
+            # Simple visualization implementation
+            import cv2
+            import matplotlib.pyplot as plt
+            # from mmdet3d.core.visualizer import show_result as show_result_mesh
+            # from mmdet3d.core.visualizer import show_seg_result
+
+            # Check for result format
+            if isinstance(pred_result, dict):
+                # Convert dict result to format expected by visualization
+                bboxes = pred_result.get('boxes_3d', None)
+                scores = pred_result.get('scores_3d', None)
+                labels = pred_result.get('labels_3d', None)
+                
+                if bboxes is not None:
+                    # Move to CPU numpy
+                    bboxes = bboxes.tensor.cpu().numpy()
+                    scores = scores.cpu().numpy()
+                    labels = labels.cpu().numpy()
+            else:
+                return
+
+            # Basic BEV visualization using matplotlib
+            fig = plt.figure(figsize=(10, 10))
+            ax = plt.gca()
+            ax.set_aspect('equal')
+            
+            # Draw points (BEV)
+            if points is not None:
+                # x, y coordinates
+                plt.scatter(points[:, 0], points[:, 1], s=0.5, c='gray', alpha=0.5)
+            
+            # Draw bboxes
+            if bboxes is not None:
+                for i in range(len(bboxes)):
+                    if scores[i] < 0.3: continue # Filter low score
+                    
+                    # Simple box drawing (center and dimensions)
+                    # For full 3D box projection, more complex logic is needed
+                    # Here we just plot center and approximate extent
+                    xc, yc = bboxes[i, 0], bboxes[i, 1]
+                    # dx, dy = bboxes[i, 3], bboxes[i, 4]
+                    # angle = bboxes[i, 6]
+                    
+                    # Just plot center for now to avoid rotation logic issues without libraries
+                    plt.plot(xc, yc, 'r+', markersize=10)
+                    
+                    # Add label text
+                    plt.text(xc, yc, f"{int(labels[i])}: {scores[i]:.2f}", color='red', fontsize=8)
+            
+            # Set limits based on point cloud range
+            plt.xlim(-54, 54)
+            plt.ylim(-54, 54)
+            
+            if out_dir:
+                out_path = osp.join(out_dir, f"{filename}_bev.png")
+                print(f"Saving visualization to {out_path}")
+                plt.savefig(out_path)
+                plt.close(fig)
+        
+        if out_dir:
+            mmcv.mkdir_or_exist(out_dir)
+
+        # Handle batch size
+        batch_size = len(result)
+        for i in range(batch_size):
+            # Extract metadata
+            if 'metas' in data:
+                img_metas = data['metas'].data[0][i]
+            elif 'img_metas' in data:
+                img_metas = data['img_metas'].data[0][i]
+            else:
+                # Fallback or error
+                continue
+                
+            # Extract points
+            if 'points' in data:
+                points = data['points'].data[0][i].numpy()
+            else:
+                points = None
+
+            # Get prediction result for this sample
+            pred_result = result[i]
+            
+            # Construct file name from the sample token or filename
+            if 'pts_filename' in img_metas:
+                file_name = osp.split(img_metas['pts_filename'])[-1].split('.')[0]
+            else:
+                file_name = f"sample_{i}"
+                
+            out_file = osp.join(out_dir, file_name) if out_dir else None
+
+            # Visualize
+            # Note: mmdet3d show_result signature might vary, using a generic call
+            # Assuming pred_result follows mmdet3d format (dict with 'boxes_3d', 'scores_3d', 'labels_3d')
+            show_result(
+                points,
+                None,  # gt_bboxes
+                pred_result,
+                out_dir,
+                file_name,
+                show=show,
+                snapshot=True  # Usually visualize camera images if available
+            )
+
     @auto_fp16(apply_to=("img", "points"))
     def forward(
         self,
