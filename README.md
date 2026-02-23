@@ -193,6 +193,69 @@ torchpack dist-run -np 8 python tools/train.py configs/nuscenes/seg/fusion-bev25
 
 Note: please run `tools/test.py` separately after training to get the final evaluation metrics.
 
+## Quantization
+
+This repository integrates [MQBench](https://github.com/ModelTC/MQBench) to support INT8 quantization targeting the **TensorRT** backend. Two quantization workflows are provided:
+
+### QAT (Quantization-Aware Training) — `tools/quant_train.py`
+
+**Algorithm**: Fake quantization with Straight-Through Estimator (STE).  
+Weights use per-channel symmetric INT8; activations use per-tensor symmetric INT8.  
+The model is fine-tuned end-to-end while simulating quantization effects.
+
+```bash
+# Single GPU
+python tools/quant_train.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth
+
+# Multi-GPU distributed
+torchpack dist-run -np 8 python tools/quant_train.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth
+```
+
+### PTQ (Post-Training Quantization, MinMax) — `tools/quant_ptq.py`
+
+**Algorithm**: MinMax calibration — the simplest PTQ method.  
+A small subset of the training data (calibration batches) is forwarded through the model to collect per-layer activation min/max statistics. Quantization scales are derived directly from these statistics. **No model weight updates are required.**
+
+| Step | Description |
+|------|-------------|
+| 1 | Load pretrained FP32 model |
+| 2 | Insert FakeQuantize nodes via `prepare_by_platform` |
+| 3 | `enable_calibration` → forward N calibration batches to collect min/max |
+| 4 | `enable_quantization` → freeze observers, activate fake quant |
+| 5 | Evaluate quantized model accuracy |
+| 6 | Save quantized checkpoint for deployment |
+
+```bash
+# Single GPU (default: 128 calibration batches)
+python tools/quant_ptq.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth
+
+# Customize number of calibration batches
+python tools/quant_ptq.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --calib-batches 256
+
+# Multi-GPU distributed
+torchpack dist-run -np 8 python tools/quant_ptq.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth
+```
+
+### Quantization Method Comparison
+
+| Method | Script | Accuracy | Speed | Requires Training Data |
+|--------|--------|----------|-------|------------------------|
+| PTQ MinMax | `quant_ptq.py` | ★★☆ | Fastest | Small calibration set only |
+| QAT | `quant_train.py` | ★★★ | Slowest | Full training set + fine-tuning |
+
+**Recommended workflow**: Start with PTQ MinMax for a quick baseline. If accuracy drop is unacceptable, switch to QAT for fine-tuning.
+
 ## Deployment on TensorRT
 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_AI_Solution/tree/master/CUDA-BEVFusion): Best practice for TensorRT, which provides INT8 acceleration solutions and achieves 25fps on ORIN.
 
