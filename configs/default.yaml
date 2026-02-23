@@ -1,27 +1,37 @@
-seed: 0
-deterministic: false
+# ========== 随机种子与确定性 ==========
+seed: 0  # 随机种子，用于复现实验结果
+deterministic: false  # 是否使用确定性算法（true会降低性能但提高复现性）
 
+# ========== 检查点保存配置 ==========
 checkpoint_config:
-  interval: 1
-  max_keep_ckpts: 1
+  interval: 1  # 每1个epoch保存一次检查点
+  max_keep_ckpts: 1  # 最多保留最近1个检查点（节省磁盘空间）
 
+# ========== 日志配置 ==========
 log_config:
-  interval: 50
-  hooks:
+  interval: 50  # 每50次迭代打印一次日志
+  hooks:  # 日志钩子列表
+    # 控制台文本日志
     -
-      type: TextLoggerHook
-    -
-      type: TensorboardLoggerHook
+      type: TextLoggerHook  # 将训练信息输出到控制台和文件
+    # TensorBoard可视化日志
+    # -
+    #   type: TensorboardLoggerHook  # 将训练信息保存为TensorBoard格式，用于Web可视化
 
-load_from: null
-resume_from: null
+# ========== 模型加载与恢复 ==========
+load_from: null  # 加载预训练模型的路径（null表示不加载）
+resume_from: null  # 从断点恢复训练的路径（null表示从零开始）
 
-cudnn_benchmark: false
-fp16:
-  loss_scale: 
-    growth_interval: 2000
+# ========== CUDA与混合精度配置 ==========
+cudnn_benchmark: false  # 是否使用cuDNN自动优化（false确保复现性）
+fp16:  # 混合精度训练配置
+  loss_scale:   # 损失缩放，用于防止float16下梯度下溢
+    growth_interval: 2000  # 每2000步尝试增加loss_scale
 
-max_epochs: 20
+# ========== 训练周期配置 ==========
+max_epochs: 20  # 最大训练epoch数
+
+# ========== 训练器配置 ==========
 runner:
-  type: CustomEpochBasedRunner
-  max_epochs: ${max_epochs}
+  type: CustomEpochBasedRunner  # 使用自定义的epoch-based训练器
+  max_epochs: ${max_epochs}  # 使用上面定义的max_epochs值

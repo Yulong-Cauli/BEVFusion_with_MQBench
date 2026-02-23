@@ -30,6 +30,8 @@ BEVFusion QAT (Quantization-Aware Training) Demo with MQBench
 import argparse
 import copy
 import os
+import sys
+sys.path.append(os.getcwd())
 import random
 import time
 import warnings

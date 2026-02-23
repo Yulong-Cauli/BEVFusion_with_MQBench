@@ -586,6 +586,7 @@ class TransFusionHead(nn.Module):
 
     @force_fp32(apply_to=("preds_dicts"))
     def loss(self, gt_bboxes_3d, gt_labels_3d, preds_dicts, **kwargs):
+        gt_labels_3d = [lbl.long() for lbl in gt_labels_3d]
         """Loss function for CenterHead.
         Args:
             gt_bboxes_3d (list[:obj:`LiDARInstance3DBoxes`]): Ground

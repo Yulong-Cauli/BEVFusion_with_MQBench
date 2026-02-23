@@ -1,192 +1,238 @@
-dataset_type: NuScenesDataset
-dataset_root: data/nuscenes/
-gt_paste_stop_epoch: -1
-reduce_beams: 32
-load_dim: 5
-use_dim: 5
-load_augmented: null
+# ========== 数据集配置 ==========
+dataset_type: NuScenesDataset  # 使用NuScenes数据集
+dataset_root: data/nuscenes/  # 数据集根目录
+gt_paste_stop_epoch: -1  # GT粘贴数据增强的停止epoch（-1表示始终使用）
+reduce_beams: 32  # 将激光雷达beam数量从64降低到32  tips:beam表示波束
+load_dim: 5  # 加载点云的维度（x, y, z, intensity, ring）
+use_dim: 5  # 实际使用的点云维度
+load_augmented: null  # 是否加载增强的点云数据
 
-point_cloud_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
-voxel_size: [0.1, 0.1, 0.2]
-image_size: [256, 704]
+# ========== 传感器参数 ==========
+point_cloud_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]  # 点云范围 [x_min, y_min, z_min, x_max, y_max, z_max]
+voxel_size: [0.1, 0.1, 0.2]  # 体素大小（单位：米），用于点云体素化
+image_size: [256, 704]  # 相机图像的最终尺寸 [高, 宽]
 
+# ========== 2D图像数据增强配置 ==========
 augment2d:
-  resize: [[0.38, 0.55], [0.48, 0.48]]
-  rotate: [-5.4, 5.4]
+  resize: [[0.38, 0.55], [0.48, 0.48]]  # 图像缩放范围，[训练范围, 测试范围]
+  rotate: [-5.4, 5.4]  # 旋转角度范围（度），用于图像旋转增强
   gridmask:
-    prob: 0.0
-    fixed_prob: true
+    prob: 0.0  # GridMask应用概率（0.0表示不使用）
+    fixed_prob: true  # 是否固定概率
 
+# ========== 3D点云数据增强配置 ==========
 augment3d:
-  scale: [0.9, 1.1]
-  rotate: [-0.78539816, 0.78539816]
-  translate: 0.5
+  scale: [0.9, 1.1]  # 缩放因子范围（物体大小缩放）
+  rotate: [-0.78539816, 0.78539816]  # 旋转角度范围（弧度，约±45度）
+  translate: 0.5  # 平移距离范围（米）
 
-object_classes:
+# ========== 目标类别定义 ==========
+object_classes:  # 3D目标检测的10个类别
   - car
   - truck
-  - construction_vehicle
+  - construction_vehicle # 工程车
   - bus
-  - trailer
-  - barrier
+  - trailer # 拖车
+  - barrier # 护栏
   - motorcycle
   - bicycle
-  - pedestrian
+  - pedestrian # 行人
   - traffic_cone
 
-map_classes:
-  - drivable_area
+# ========== 地图类别定义 ==========
+map_classes:  # BEV分割地图的7个类别
+  - drivable_area  # 可驾驶区域
   # - drivable_area*
-  - ped_crossing
-  - walkway
-  - stop_line
-  - carpark_area
-  # - road_divider
-  # - lane_divider
-  - divider
+  - ped_crossing  # 行人过街
+  - walkway  # 人行道
+  - stop_line  # 停止线
+  - carpark_area  # 停车区
+  # - road_divider # 道路分割线（实线类）
+  # - lane_divider # 车道分割线（虚线类）
+  - divider  # 分隔线
 
+# ========== 输入模态配置 ==========
+# 定义使用哪些传感器数据进行融合
 input_modality:
-  use_lidar: true
-  use_camera: true
-  use_radar: false
-  use_map: false
-  use_external: false
+  use_lidar: true  # 使用激光雷达点云
+  use_camera: true  # 使用相机图像
+  use_radar: false  # 不使用雷达
+  use_map: false  # 不使用地图
+  use_external: false  # 不使用外部数据
 
+# ========== 训练数据处理流程 ==========
 train_pipeline:
+  # 加载多视图相机图像
   -
     type: LoadMultiViewImageFromFiles
-    to_float32: true
+    to_float32: true  # 将图像转换为float32格式
+  
+  # 加载当前帧的激光雷达点云
   -
     type: LoadPointsFromFile
-    coord_type: LIDAR
-    load_dim: ${load_dim}
-    use_dim: ${use_dim}
-    reduce_beams: ${reduce_beams}
+    coord_type: LIDAR  # 坐标系类型
+    load_dim: ${load_dim}  # 加载维度
+    use_dim: ${use_dim}  # 使用维度
+    reduce_beams: ${reduce_beams}  # 降低beam数量
     load_augmented: ${load_augmented}
+  
+  # 加载多帧扫描的点云（时间融合）
   -
     type: LoadPointsFromMultiSweeps
-    sweeps_num: 9
+    sweeps_num: 9  # 使用9帧历史点云
     load_dim: ${load_dim}
     use_dim: ${use_dim}
     reduce_beams: ${reduce_beams}
-    pad_empty_sweeps: true
-    remove_close: true
+    pad_empty_sweeps: true  # 补零处理空扫描
+    remove_close: true  # 移除近距离点云
     load_augmented: ${load_augmented}
+  
+  # 加载3D标注（边界框、标签）
   -
     type: LoadAnnotations3D
-    with_bbox_3d: true
-    with_label_3d: true
-    with_attr_label: False
-  -
-    type: ObjectPaste
-    stop_epoch: ${gt_paste_stop_epoch}
-    db_sampler:
-      dataset_root: ${dataset_root}
-      info_path: ${dataset_root + "nuscenes_dbinfos_train.pkl"}
-      rate: 1.0
-      prepare: 
-        filter_by_difficulty: [-1]
-        filter_by_min_points:
-          car: 5
-          truck: 5
-          bus: 5
-          trailer: 5
-          construction_vehicle: 5
-          traffic_cone: 5
-          barrier: 5
-          motorcycle: 5
-          bicycle: 5
-          pedestrian: 5
-      classes: ${object_classes}
-      sample_groups:
-        car: 2
-        truck: 3
-        construction_vehicle: 7
-        bus: 4
-        trailer: 6
-        barrier: 2
-        motorcycle: 6
-        bicycle: 6
-        pedestrian: 2
-        traffic_cone: 2
-      points_loader:
-        type: LoadPointsFromFile
-        coord_type: LIDAR
-        load_dim: ${load_dim}
-        use_dim: ${use_dim}
-        reduce_beams: ${reduce_beams}
+    with_bbox_3d: true  # 加载3D边界框
+    with_label_3d: true  # 加载3D标签
+    with_attr_label: False  # 不加载属性标签
+  
+  # 数据库中采样粘贴物体增强
+  # -
+  #   type: ObjectPaste
+  #   stop_epoch: ${gt_paste_stop_epoch}  # 停止使用此增强的epoch
+  #   db_sampler:
+  #     dataset_root: ${dataset_root}
+  #     info_path: ${dataset_root + "nuscenes_infos_temporal_train.pkl"}  # 训练数据库信息
+  #     rate: 1.0  # 应用率
+  #     prepare: 
+  #       filter_by_difficulty: [-1]  # 不按难度过滤
+  #       filter_by_min_points:  # 按最小点数过滤
+  #         car: 5
+  #         truck: 5
+  #         bus: 5
+  #         trailer: 5
+  #         construction_vehicle: 5
+  #         traffic_cone: 5
+  #         barrier: 5
+  #         motorcycle: 5
+  #         bicycle: 5
+  #         pedestrian: 5
+  #     classes: ${object_classes}  # 采样的类别
+  #     sample_groups:  # 每个类别的采样数量
+  #       car: 2
+  #       truck: 3
+  #       construction_vehicle: 7
+  #       bus: 4
+  #       trailer: 6
+  #       barrier: 2
+  #       motorcycle: 6
+  #       bicycle: 6
+  #       pedestrian: 2
+  #       traffic_cone: 2
+  #     points_loader:
+  #       type: LoadPointsFromFile
+  #       coord_type: LIDAR
+  #       load_dim: ${load_dim}
+  #       use_dim: ${use_dim}
+  #       reduce_beams: ${reduce_beams}
+  
+  # 图像增强（缩放、旋转、翻转）
   -
     type: ImageAug3D
-    final_dim: ${image_size}
-    resize_lim: ${augment2d.resize[0]}
-    bot_pct_lim: [0.0, 0.0]
-    rot_lim: ${augment2d.rotate}
-    rand_flip: true
+    final_dim: ${image_size}  # 最终图像尺寸
+    resize_lim: ${augment2d.resize[0]}  # 训练时的缩放范围
+    bot_pct_lim: [0.0, 0.0]  # 底部裁剪比例
+    rot_lim: ${augment2d.rotate}  # 旋转范围
+    rand_flip: true  # 随机翻转
     is_train: true
+  
+  # 全局3D变换（缩放、旋转、平移）
   -
     type: GlobalRotScaleTrans
-    resize_lim: ${augment3d.scale}
-    rot_lim: ${augment3d.rotate}
-    trans_lim: ${augment3d.translate}
+    resize_lim: ${augment3d.scale}  # 缩放范围
+    rot_lim: ${augment3d.rotate}  # 旋转范围
+    trans_lim: ${augment3d.translate}  # 平移范围
     is_train: true
-  -
-    type: LoadBEVSegmentation
-    dataset_root: ${dataset_root}
-    xbound: [-50.0, 50.0, 0.5]
-    ybound: [-50.0, 50.0, 0.5]
-    classes: ${map_classes}
+  
+  # 加载BEV分割标签
+  # -
+  #   type: LoadBEVSegmentation
+  #   dataset_root: ${dataset_root}
+  #   xbound: [-50.0, 50.0, 0.5]  # X轴范围和分辨率
+  #   ybound: [-50.0, 50.0, 0.5]  # Y轴范围和分辨率
+  #   classes: ${map_classes}  # 分割类别
+  
+  # 随机翻转
   -
     type: RandomFlip3D
+  
+  # 过滤点云范围
   -
     type: PointsRangeFilter
     point_cloud_range: ${point_cloud_range}
+  
+  # 过滤点云范围外的物体
   -
     type: ObjectRangeFilter
     point_cloud_range: ${point_cloud_range}
+  
+  # 过滤不需要的物体类别
   -
     type: ObjectNameFilter
     classes: ${object_classes}
+  
+  # 图像标准化
   -
     type: ImageNormalize
-    mean: [0.485, 0.456, 0.406]
-    std: [0.229, 0.224, 0.225]
+    mean: [0.485, 0.456, 0.406]  # ImageNet均值
+    std: [0.229, 0.224, 0.225]  # ImageNet标准差
+  
+  # GridMask增强（随机遮挡）
   - 
     type: GridMask
-    use_h: true
-    use_w: true
+    use_h: true  # 对高度应用
+    use_w: true  # 对宽度应用
     max_epoch: ${max_epochs}
-    rotate: 1
-    offset: false
-    ratio: 0.5
+    rotate: 1  # 旋转
+    offset: false  # 不偏移
+    ratio: 0.5  # 遮挡比例
     mode: 1
-    prob: ${augment2d.gridmask.prob}
+    prob: ${augment2d.gridmask.prob}  # 应用概率
     fixed_prob: ${augment2d.gridmask.fixed_prob}
+  
+  # 随机打乱点云顺序
   -
     type: PointShuffle
+  
+  # 格式化为模型输入格式
   -
     type: DefaultFormatBundle3D
     classes: ${object_classes}
+  
+  # 收集用于训练的字段
   -
     type: Collect3D
-    keys:
-      - img
-      - points
-      - gt_bboxes_3d
-      - gt_labels_3d
-      - gt_masks_bev
-    meta_keys:
-      - camera_intrinsics
-      - camera2ego
-      - lidar2ego
-      - lidar2camera
-      - camera2lidar
-      - lidar2image
-      - img_aug_matrix
-      - lidar_aug_matrix
+    keys:  # 收集的数据字段
+      - img  # 图像
+      - points  # 点云
+      - gt_bboxes_3d  # 真实3D边界框
+      - gt_labels_3d  # 真实3D标签
+      # - gt_masks_bev  # BEV分割真实标签
+    meta_keys:  # 元信息字段
+      - camera_intrinsics  # 相机内参
+      - camera2ego  # 相机到车体坐标系变换
+      - lidar2ego  # 激光雷达到车体坐标系变换
+      - lidar2camera  # 激光雷达到相机坐标系变换
+      - camera2lidar  # 相机到激光雷达坐标系变换
+      - lidar2image  # 激光雷达到图像坐标系变换
+      - img_aug_matrix  # 图像增强矩阵
+      - lidar_aug_matrix  # 点云增强矩阵
+  
+  # 生成深度标签
   -
     type: GTDepth
-    keyframe_only: true 
+    keyframe_only: true  # 仅对关键帧生成 
 
+# ========== 测试数据处理流程 ==========
+# 类似训练流程，但关闭数据增强
 test_pipeline:
   -
     type: LoadMultiViewImageFromFiles
@@ -212,36 +258,45 @@ test_pipeline:
     with_bbox_3d: true
     with_label_3d: true
     with_attr_label: False
+  
+  # 图像增强（仅调整到统一尺寸，不旋转翻转）
   -
     type: ImageAug3D
     final_dim: ${image_size}
-    resize_lim: ${augment2d.resize[1]}
+    resize_lim: ${augment2d.resize[1]}  # 测试时的缩放范围
     bot_pct_lim: [0.0, 0.0]
-    rot_lim: [0.0, 0.0]
-    rand_flip: false
+    rot_lim: [0.0, 0.0]  # 不旋转
+    rand_flip: false  # 不翻转
     is_train: false
+  
+  # 3D变换（仅保持原尺度）
   -
     type: GlobalRotScaleTrans
-    resize_lim: [1.0, 1.0]
-    rot_lim: [0.0, 0.0]
-    trans_lim: 0.0
+    resize_lim: [1.0, 1.0]  # 不缩放
+    rot_lim: [0.0, 0.0]  # 不旋转
+    trans_lim: 0.0  # 不平移
     is_train: false
-  -
-    type: LoadBEVSegmentation
-    dataset_root: ${dataset_root}
-    xbound: [-50.0, 50.0, 0.5]
-    ybound: [-50.0, 50.0, 0.5]
-    classes: ${map_classes}
+  
+  # -
+  #   type: LoadBEVSegmentation
+  #   dataset_root: ${dataset_root}
+  #   xbound: [-50.0, 50.0, 0.5]
+  #   ybound: [-50.0, 50.0, 0.5]
+  #   classes: ${map_classes}
+  
   -
     type: PointsRangeFilter
     point_cloud_range: ${point_cloud_range}
+  
   -
     type: ImageNormalize
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
+  
   -
     type: DefaultFormatBundle3D
     classes: ${object_classes}
+  
   -
     type: Collect3D
     keys:
@@ -249,7 +304,7 @@ test_pipeline:
       - points
       - gt_bboxes_3d
       - gt_labels_3d
-      - gt_masks_bev
+      # - gt_masks_bev
     meta_keys:
       - camera_intrinsics
       - camera2ego
@@ -259,48 +314,57 @@ test_pipeline:
       - lidar2image
       - img_aug_matrix
       - lidar_aug_matrix
+  
   -
     type: GTDepth
     keyframe_only: true 
 
+# ========== 数据加载器配置 ==========
 data:
-  samples_per_gpu: 4
-  workers_per_gpu: 0
+  samples_per_gpu: 1  # 每个GPU的批次大小
+  workers_per_gpu: 0  # 每个GPU的数据加载工作进程数（0表示主线程加载）
+  
+  # 训练数据集配置
   train:
-    type: CBGSDataset
+    type: CBGSDataset  # 使用CBGS（Class-Balanced Group Sampling）数据集
     dataset:
-      type: ${dataset_type}
+      type: ${dataset_type}  # NuScenesDataset
       dataset_root: ${dataset_root}
-      ann_file: ${dataset_root + "nuscenes_infos_train.pkl"}
-      pipeline: ${train_pipeline}
+      ann_file: ${dataset_root + "nuscenes_infos_temporal_train.pkl"}  # 训练集标注文件
+      pipeline: ${train_pipeline}  # 使用训练流程
       object_classes: ${object_classes}
       map_classes: ${map_classes}
       modality: ${input_modality}
       test_mode: false
-      use_valid_flag: true
-      box_type_3d: LiDAR
+      use_valid_flag: true  # 使用标志过滤无效样本
+      box_type_3d: LiDAR  # 3D框坐标系类型
+  
+  # 验证数据集配置
   val:
     type: ${dataset_type}
     dataset_root: ${dataset_root}
-    ann_file: ${dataset_root + "nuscenes_infos_temporal_val.pkl"}
-    pipeline: ${test_pipeline}
+    ann_file: ${dataset_root + "nuscenes_infos_temporal_val.pkl"}  # 验证集标注文件
+    pipeline: ${test_pipeline}  # 使用测试流程
     object_classes: ${object_classes}
     map_classes: ${map_classes}
     modality: ${input_modality}
     test_mode: false
     box_type_3d: LiDAR
+  
+  # 测试数据集配置
   test:
     type: ${dataset_type}
     dataset_root: ${dataset_root}
-    ann_file: ${dataset_root + "nuscenes_infos_temporal_val.pkl"}
+    ann_file: ${dataset_root + "nuscenes_infos_temporal_val.pkl"}  # 使用验证集进行测试
     pipeline: ${test_pipeline}
     object_classes: ${object_classes}
     map_classes: ${map_classes}
     modality: ${input_modality}
-    test_mode: true
+    test_mode: true  # 测试模式
     box_type_3d: LiDAR
 
+# ========== 评估配置 ==========
 evaluation:
-  interval: 1
-  pipeline: ${test_pipeline}
+  interval: 1  # 每1个epoch进行一次评估
+  pipeline: ${test_pipeline}  # 使用测试流程进行评估
  

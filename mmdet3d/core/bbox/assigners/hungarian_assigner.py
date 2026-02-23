@@ -111,6 +111,7 @@ class HungarianAssigner3D(BaseAssigner):
 
         # 2. compute the weighted costs
         # see mmdetection/mmdet/core/bbox/match_costs/match_cost.py
+        gt_labels = gt_labels.long()
         cls_cost = self.cls_cost(cls_pred[0].T, gt_labels)
         reg_cost = self.reg_cost(bboxes, gt_bboxes, train_cfg)
         iou = self.iou_calculator(bboxes, gt_bboxes)

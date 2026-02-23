@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Test BEVFusion",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/tools/test.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml",
+                "pretrained/bevfusion-det.pth",
+                "--eval",
+                "bbox"
+            ],
+            "env": {
+                "PYTHONUTF8": "1"
+            }
+        }
+    ]
+}
