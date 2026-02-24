@@ -215,15 +215,28 @@ torchpack dist-run -np 8 python tools/quant_train.py \
     --load_from pretrained/bevfusion-det.pth
 ```
 
-### PTQ (Post-Training Quantization, MinMax) — `tools/quant_ptq.py`
+### PTQ (Post-Training Quantization, MinMax) — `tools/quant_ptq_minmax.py`
 
 **Algorithm**: MinMax calibration — the simplest PTQ method.  
 A small subset of the training data (calibration batches) is forwarded through the model to collect per-layer activation min/max statistics. Quantization scales are derived directly from these statistics. **No model weight updates are required.**
 
+**Selective quantization strategy**: Only dense convolutional sub-modules are quantized.
+Parts that are **skipped** (incompatible with standard PTQ):
+- `camera/vtransform` — contains custom CUDA `bev_pool` operator
+- `lidar/voxelize` — point-cloud preprocessing, not a neural-network layer
+- `lidar/backbone` (SparseEncoder) — sparse convolution, incompatible with standard FakeQuant
+
+Parts that **are quantized** (standard dense conv, fully traceable by `torch.fx`):
+- Camera backbone (SwinTransformer / ResNet)
+- Camera neck (GeneralizedLSSFPN / FPN)
+- Fuser (ConvFuser)
+- Decoder backbone & neck
+- Detection / segmentation heads
+
 | Step | Description |
 |------|-------------|
 | 1 | Load pretrained FP32 model |
-| 2 | Insert FakeQuantize nodes via `prepare_by_platform` |
+| 2 | Apply `prepare_by_platform` to each quantizable sub-module individually |
 | 3 | `enable_calibration` → forward N calibration batches to collect min/max |
 | 4 | `enable_quantization` → freeze observers, activate fake quant |
 | 5 | Evaluate quantized model accuracy |
@@ -231,27 +244,53 @@ A small subset of the training data (calibration batches) is forwarded through t
 
 ```bash
 # Single GPU (default: 128 calibration batches)
-python tools/quant_ptq.py \
+python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load_from pretrained/bevfusion-det.pth
 
 # Customize number of calibration batches
-python tools/quant_ptq.py \
+python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load_from pretrained/bevfusion-det.pth \
     --calib-batches 256
 
 # Multi-GPU distributed
-torchpack dist-run -np 8 python tools/quant_ptq.py \
+torchpack dist-run -np 8 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load_from pretrained/bevfusion-det.pth
+```
+
+### Benchmark — Model Size & Inference Time — `tools/quant_benchmark.py`
+
+Report model size (parameter count, memory footprint, estimated INT8 size) and measure
+GPU inference latency for FP32 and/or quantized models.
+
+```bash
+# Report FP32 model size only
+python tools/quant_benchmark.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --checkpoint pretrained/bevfusion-det.pth \
+    --size-only
+
+# Measure inference latency using real validation data
+python tools/quant_benchmark.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --checkpoint pretrained/bevfusion-det.pth \
+    --use-real-data --num-iters 50
+
+# Compare FP32 vs quantized model
+python tools/quant_benchmark.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --checkpoint pretrained/bevfusion-det.pth \
+    --quant-checkpoint runs/ptq_minmax/ptq_minmax_model.pth \
+    --use-real-data --num-iters 50
 ```
 
 ### Quantization Method Comparison
 
 | Method | Script | Accuracy | Speed | Requires Training Data |
 |--------|--------|----------|-------|------------------------|
-| PTQ MinMax | `quant_ptq.py` | ★★☆ | Fastest | Small calibration set only |
+| PTQ MinMax | `quant_ptq_minmax.py` | ★★☆ | Fastest | Small calibration set only |
 | QAT | `quant_train.py` | ★★★ | Slowest | Full training set + fine-tuning |
 
 **Recommended workflow**: Start with PTQ MinMax for a quick baseline. If accuracy drop is unacceptable, switch to QAT for fine-tuning.
