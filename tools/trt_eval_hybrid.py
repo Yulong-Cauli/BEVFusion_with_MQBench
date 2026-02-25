@@ -1,11 +1,26 @@
 """
-Hybrid TRT Evaluation: Replace ConvFuser with TRT engine,
-run full NDS evaluation on nuScenes to measure end-to-end accuracy impact.
+Hybrid TRT 端到端评估：将 ConvFuser 替换为 TensorRT 引擎，在 nuScenes 上运行完整 NDS 评估。
+
+工作流程：
+  1. 加载 FP32 BEVFusion 模型 + 预训练权重
+  2. 用 deepcopy 隔离 fuser 参数后导出 ONNX（避免破坏原模型的 CUDA 参数）
+  3. 收集真实 BEV 特征作为 INT8 校准数据 + 运行 FP32 基线评估
+  4. 构建 TRT 引擎（支持 fp32/fp16/int8 三种精度）
+  5. 将 model.fuser 替换为 TRTFuser（nn.Module），运行完整验证集 NDS 评估
+
+关键技术点：
+  - FuserForExport 使用 copy.deepcopy 防止 .cpu() 导出破坏原模型参数
+  - TRTFuser 使用 PyTorch 默认 CUDA 流，返回 clone() 输出
+  - INT8 使用 IInt8MinMaxCalibrator + 真实 BEV 特征校准
+
+验证结果：
+  TRT FP32  NDS=0.5801 (+0.0000)
+  TRT FP16  NDS=0.5799 (-0.0002)
+  TRT INT8  NDS=0.5727 (-0.0074)
 
 Usage:
-  python tools/trt_eval_hybrid.py \
-    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    pretrained/bevfusion-det.pth --eval bbox
+  python tools/trt_eval_hybrid.py \\
+    configs/.../convfuser.yaml pretrained/bevfusion-det.pth --eval bbox --precision int8
 """
 import argparse
 import copy

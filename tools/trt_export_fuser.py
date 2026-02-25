@@ -1,6 +1,19 @@
 """
-Export ConvFuser to ONNX and build TensorRT FP32/FP16/INT8 engines.
-Benchmark latency and model size comparison.
+ConvFuser TensorRT 导出与隔离性能测试。
+
+功能：
+  1. 将 ConvFuser (Conv2d 336→256 + BN + ReLU) 导出为 FP32 ONNX
+  2. 分别构建 FP32/FP16/INT8 三种精度的 TRT 引擎
+  3. 对比 PyTorch FP32 vs 各 TRT 精度的推理延迟和引擎大小
+
+此为隔离 PoC 测试（使用随机初始化权重），验证 ConvFuser 的 TRT 导出可行性。
+真实权重的精度验证见 trt_accuracy_test.py，端到端 NDS 评估见 trt_eval_hybrid.py。
+
+实测结果（RTX 4060 Laptop, TRT 10.15）：
+  PyTorch FP32: 5.083 ms
+  TRT FP32:     4.017 ms (1.27x)
+  TRT FP16:     1.437 ms (3.54x)
+  TRT INT8:     0.746 ms (6.81x)
 """
 import os, sys, time
 import torch
