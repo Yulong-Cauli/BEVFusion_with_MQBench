@@ -313,6 +313,35 @@ MQBench 的 `convert_deploy` API 不兼容列表输入（ConvFuser 的 `forward`
 - 务实做法：FP32 ONNX + TRT 原生 INT8 校准（Entropy Calibrator）可获得 6.8x 加速
 - 下一步可将此方案推广到 decoder/backbone、decoder/neck、camera/neck
 
+---
+
+## 2026-02-25 · PTQ 4/6 完整 NDS 评估（最终确认）
+
+**目标**：对 4/6 模块量化后的模型进行完整的 nuScenes NDS/mAP 评估，确认 MinMax PTQ 的精度影响。
+
+### 命令
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/quant_ptq_minmax.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    --load_from pretrained/bevfusion-det.pth `
+    --calib-batches 128
+```
+
+### 结果
+
+| 指标 | FP32 基线 | PTQ 4/6 | 变化 |
+|------|----------|---------|------|
+| NDS  | 0.5801   | **0.5810** | +0.0009 |
+| mAP  | 0.5742   | **0.5759** | +0.0017 |
+
+**逐类 AP**：car 0.918, truck 0.840, bus 0.995, pedestrian 0.922, motorcycle 0.699, bicycle 0.518, traffic_cone 0.866。
+
+### 结论
+
+✅ MinMax PTQ（最朴素的量化方法）在 4/6 模块量化后实现了**零精度损失**。NDS 和 mAP 均在噪声范围内微升，证明 decoder/backbone、decoder/neck、camera/neck、fuser 四个子模块可安全量化为 INT8。
+
 
 
 

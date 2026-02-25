@@ -15,7 +15,7 @@
 | `decoder/neck` | SECONDFPN | ✅ 成功 | 已修复：移除 Proxy 上的 `len()` 断言 + `patch_mmcv_for_fx()` |
 | `heads/object` | TransFusionHead | ❌ 失败 | Proxy 对象被 for 循环迭代 |
 
-**结论**：`decoder/backbone`、`decoder/neck`、`camera/neck`、`fuser` 共 4 个模块成功量化，量化覆盖率 **4/6**。PTQ NDS = 0.5774（FP32 基线 0.5801，精度损失 0.27%）。
+**结论**：`decoder/backbone`、`decoder/neck`、`camera/neck`、`fuser` 共 4 个模块成功量化，量化覆盖率 **4/6**。PTQ NDS = **0.5810**（FP32 基线 0.5801，精度无损，+0.0009）。
 
 ---
 

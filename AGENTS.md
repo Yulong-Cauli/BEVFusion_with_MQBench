@@ -29,7 +29,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 | 脚本 | 状态 | 结果 |
 |------|------|------|
 | `tools/test.py` | ✅ | NDS = 0.5800 |
-| `tools/quant_ptq_minmax.py` | ✅ | NDS = 0.5774（PTQ 4/6 模块量化，精度损失 0.27%） |
+| `tools/quant_ptq_minmax.py` | ✅ | NDS = 0.5810（PTQ 4/6 模块量化，精度无损，+0.0009 vs FP32） |
 | `tools/quant_benchmark.py` | ✅ | 可运行 |
 | `tools/trt_export_fuser.py` | ✅ | ConvFuser TRT PoC：INT8 6.81x 加速 |
 | `tools/train.py` | ⚠️ | NaN 修复已应用但未验证 |

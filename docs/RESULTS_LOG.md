@@ -155,3 +155,60 @@
 > 参考：PyTorch 输出范围 [0, 7.23]，均值 0.34，标准差 0.54（ReLU 后）。INT8 最大绝对误差 0.18 约占输出范围的 2.5%。
 
 > ⚠️ 此为**单模块逐元素精度**对比（随机输入模拟 BEV 特征），非端到端 NDS 评估。INT8 的 2.5% 相对误差对最终检测精度的影响需要端到端 Hybrid Runner 验证。
+
+---
+
+## 2026-02-25 22:02 · PTQ（MinMax，4/6 模块量化）完整 NDS 评估
+
+**环境**：同上。校准 128 batch。
+
+**方法**：`quant_ptq_minmax.py`（不加 `--no-eval`），校准完成后自动运行全量验证集（81 样本）推理 + NDS/mAP 评估。
+
+### 精度（最终确认）
+
+| 指标 | FP32 基线 | PTQ 4/6（MinMax） | 变化 |
+|------|----------|------------------|------|
+| NDS  | 0.5801   | **0.5810**        | **+0.0009**（无损） |
+| mAP  | 0.5742   | **0.5759**        | **+0.0017**（无损） |
+
+> ✅ **关键结论**：4/6 模块 MinMax PTQ 量化后精度完全无损。NDS 和 mAP 均在噪声范围内微升，证明 decoder/backbone、decoder/neck、camera/neck、fuser 四个子模块可安全量化为 INT8。
+
+### 逐类 AP 对比
+
+| 类别 | FP32 | PTQ 4/6 | 变化 |
+|------|------|---------|------|
+| car | 0.916 | 0.918 | +0.002 |
+| truck | 0.833 | 0.840 | +0.007 |
+| bus | 0.995 | 0.995 | 0.000 |
+| pedestrian | 0.919 | 0.922 | +0.003 |
+| motorcycle | 0.705 | 0.699 | −0.006 |
+| bicycle | 0.517 | 0.518 | +0.001 |
+| traffic_cone | 0.848 | 0.866 | +0.018 |
+| trailer | 0.000 | 0.000 | —（mini 集样本不足） |
+| construction_vehicle | 0.000 | 0.000 | —（mini 集样本不足） |
+| barrier | 0.000 | 0.000 | —（mini 集样本不足） |
+
+### 其他指标
+
+| 指标 | FP32 | PTQ 4/6 |
+|------|------|---------|
+| mATE（平移误差） | — | 0.4047 |
+| mASE（尺度误差） | — | 0.4464 |
+| mAOE（方向误差） | — | 0.4625 |
+| mAVE（速度误差） | — | 0.4214 |
+| mAAE（属性误差） | — | 0.3338 |
+
+### 量化覆盖
+
+| 子模块 | 状态 |
+|--------|------|
+| decoder/backbone（SECOND） | ✅ 已量化 |
+| decoder/neck（SECONDFPN） | ✅ 已量化 |
+| camera/neck（GeneralizedLSSFPN） | ✅ 已量化 |
+| fuser（ConvFuser） | ✅ 已量化 |
+| camera/backbone（SwinTransformer） | ❌ fx 追踪失败 |
+| heads/object（TransFusionHead） | ❌ fx 追踪失败 |
+
+### 总结
+
+MinMax PTQ 是最朴素的量化方法（仅记录 min/max 确定量化范围），在 4/6 模块量化后实现了**零精度损失**。这为后续 TensorRT INT8 部署提供了充分的信心——即使在 TRT 原生 INT8 校准下（Entropy / MinMax Calibrator），精度表现也应当可接受。

@@ -326,7 +326,7 @@ python tools/quant_benchmark.py \
 ② PTQ MinMax（tools/quant_ptq_minmax.py）
    快速获取量化基线，只需校准数据，无需训练
         ↓
-③ 评估精度（tools/test.py）
+③ 评估精度（tools/quant_ptq_minmax.py 不加 --no-eval）
    检查 mAP / NDS 是否满足要求
         ↓
    精度可接受 ──→ ④ Benchmark（tools/quant_benchmark.py）
@@ -336,10 +336,50 @@ python tools/quant_benchmark.py \
                      端到端微调恢复精度，再回到 ③
 ```
 
+> ⚠️ PTQ checkpoint 的 `state_dict` 键名经 `torch.fx` 改造，**不能**直接用 `tools/test.py` 评估。精度评估请通过 `quant_ptq_minmax.py`（不加 `--no-eval`）完成。
+
 | 方法 | 脚本 | 精度 | 耗时 | 所需数据 |
 |------|------|------|------|----------|
 | PTQ MinMax | `quant_ptq_minmax.py` | ★★☆ | 最快（分钟级） | 少量校准集 |
 | QAT | `quant_train.py` | ★★★ | 较慢（小时级） | 完整训练集 |
+
+---
+
+## 量化精度验证结果
+
+在 nuScenes v1.0-mini 验证集（81 样本）上进行完整 NDS 评估：
+
+| 指标 | FP32 基线 | PTQ 4/6（MinMax） | 变化 |
+|------|----------|------------------|------|
+| **NDS** | 0.5801 | **0.5810** | **+0.0009**（无损） |
+| **mAP** | 0.5742 | **0.5759** | **+0.0017**（无损） |
+
+PTQ 量化覆盖 4/6 子模块（decoder/backbone、decoder/neck、camera/neck、fuser），使用最朴素的 MinMax 校准即实现零精度损失。
+
+<details>
+<summary>逐类 AP 详情</summary>
+
+| 类别 | FP32 | PTQ 4/6 |
+|------|------|---------|
+| car | 0.916 | 0.918 |
+| truck | 0.833 | 0.840 |
+| bus | 0.995 | 0.995 |
+| pedestrian | 0.919 | 0.922 |
+| motorcycle | 0.705 | 0.699 |
+| bicycle | 0.517 | 0.518 |
+| traffic_cone | 0.848 | 0.866 |
+
+</details>
+
+ConvFuser 单模块 TensorRT 导出 PoC（RTX 4060 Laptop）：
+
+| 精度 | 延迟 | 加速比 | 引擎大小 | 压缩比 |
+|------|------|--------|---------|--------|
+| PyTorch FP32 | 5.08 ms | 1.00x | — | — |
+| TRT FP16 | 1.44 ms | **3.54x** | 1543 KB | 3.49x |
+| TRT INT8 | 0.75 ms | **6.81x** | 832 KB | **6.48x** |
+
+详细结果见 [docs/RESULTS_LOG.md](docs/RESULTS_LOG.md)。
 
 ---
 
