@@ -41,6 +41,7 @@ sys.path.append(os.getcwd())
 import random
 import time
 import warnings
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -66,6 +67,37 @@ except ImportError:
         "pip install mqbench"
     )
     raise
+
+
+@contextmanager
+def patch_mmcv_for_fx():
+    """Patch mmcv Conv/ConvTranspose2d wrappers for torch.fx tracing compatibility.
+
+    mmcv wraps standard PyTorch layers with a ``if x.numel() == 0`` guard for
+    backward-compat with PyTorch < 1.4.  During fx symbolic tracing the guard
+    becomes ``if Proxy:`` which raises TraceError.  We temporarily replace the
+    forward methods with the plain PyTorch parent versions so that fx can trace
+    through them.
+    """
+    import mmcv.cnn.bricks.wrappers as w
+
+    saved = {}
+    patch_map = {
+        'Conv2d': nn.Conv2d,
+        'ConvTranspose2d': nn.ConvTranspose2d,
+        'MaxPool2d': nn.MaxPool2d,
+        'Linear': nn.Linear,
+    }
+    for name, parent_cls in patch_map.items():
+        cls = getattr(w, name, None)
+        if cls is not None and hasattr(cls, 'forward'):
+            saved[name] = cls.forward
+            cls.forward = parent_cls.forward
+    try:
+        yield
+    finally:
+        for name, fwd in saved.items():
+            getattr(w, name).forward = fwd
 
 
 # ============================================================================
@@ -151,7 +183,8 @@ def apply_selective_ptq(model, backend_type, logger):
             continue
 
         try:
-            quantized = prepare_by_platform(submodule, backend_type)
+            with patch_mmcv_for_fx():
+                quantized = prepare_by_platform(submodule, backend_type)
             _set_nested_attr(model, attr_key, quantized)
             success.append(display_name)
             logger.info(f"  ✓ 量化子模块: {display_name}")
@@ -164,7 +197,8 @@ def apply_selective_ptq(model, backend_type, logger):
         for head_name, head_module in model.heads.items():
             display_name = f"heads/{head_name}"
             try:
-                quantized_head = prepare_by_platform(head_module, backend_type)
+                with patch_mmcv_for_fx():
+                    quantized_head = prepare_by_platform(head_module, backend_type)
                 model.heads[head_name] = quantized_head
                 success.append(display_name)
                 logger.info(f"  ✓ 量化子模块: {display_name}")
