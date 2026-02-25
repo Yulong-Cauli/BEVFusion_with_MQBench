@@ -255,6 +255,31 @@ fp16:
 - **不要用 `torch.fx.wrap('len')`**：它全局拦截所有 `len()` 调用，包括对普通列表的调用，导致连锁失败。正确做法是用 `self.num_ins` 等 `__init__` 中预计算的常量替代 `len(input)` 调用。
 - **mmcv 包装层是隐藏的 fx 阻断点**：mmcv 的 `Conv2d` / `ConvTranspose2d` 等包装类在 `forward` 中有 `if x.numel() == 0` 的兼容性检查（面向 PyTorch < 1.4），在 fx 追踪时会触发 `TraceError`。需要在追踪前临时 monkey-patch 为原生 PyTorch 父类版本。
 
+---
+
+## 2026-02-25 · 扩大 PTQ 量化覆盖 — fuser（ConvFuser）
+
+**目标**：修复 ConvFuser 的 `torch.fx` 追踪问题。
+
+### 问题
+
+`ConvFuser.forward` 中 `torch.cat(inputs, dim=1)` 将整个 `inputs` 参数（在 fx 追踪时是一个 Proxy 对象）直接传给 `torch.cat`。fx 看到 `torch.cat(Proxy, dim=int)`，不匹配任何有效签名。
+
+### 修复
+
+将 `torch.cat(inputs, dim=1)` 改为 `torch.cat([inputs[i] for i in range(len(self.in_channels))], dim=1)`。通过 `__getitem__` 索引让 fx 为每个元素创建独立的 Proxy 节点，最终 `torch.cat` 接收的是 `[Proxy_0, Proxy_1]`（普通 Python 列表），可正常追踪。
+
+| 文件 | 修改 |
+|------|------|
+| `mmdet3d/models/fusers/conv.py` | 一行改写（forward 中的 `torch.cat` 调用） |
+
+### 验证结果
+
+| 指标 | 修改前 | 修改后 |
+|------|--------|--------|
+| 量化成功模块数 | 3/6 | **4/6** |
+| PTQ NDS | 0.5799 | 0.5774（精度损失 0.27%，可接受） |
+
 
 
 

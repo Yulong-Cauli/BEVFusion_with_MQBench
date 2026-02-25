@@ -10,12 +10,12 @@
 |--------|------|---------|---------|
 | `camera/backbone` | SwinTransformer | ❌ 失败 | 含动态控制流（`if tensor_value:` 分支） |
 | `camera/neck` | GeneralizedLSSFPN | ✅ 成功 | 已修复：移除 Proxy 上的 `len()` 调用 + `patch_mmcv_for_fx()` |
-| `fuser` | ConvFuser | ❌ 失败 | `torch.cat(Proxy, dim=int)` 参数冲突 |
+| `fuser` | ConvFuser | ✅ 成功 | 已修复：显式索引替代 Proxy 列表传递给 `torch.cat` |
 | `decoder/backbone` | SECOND (Conv2d BEV) | ✅ 成功 | 纯静态卷积结构，fx 可追踪 |
 | `decoder/neck` | SECONDFPN | ✅ 成功 | 已修复：移除 Proxy 上的 `len()` 断言 + `patch_mmcv_for_fx()` |
 | `heads/object` | TransFusionHead | ❌ 失败 | Proxy 对象被 for 循环迭代 |
 
-**结论**：`decoder/backbone`、`decoder/neck`、`camera/neck` 共 3 个模块成功量化，量化覆盖率 **3/6**。PTQ NDS = 0.5799（FP32 基线 0.5801，无精度损失）。
+**结论**：`decoder/backbone`、`decoder/neck`、`camera/neck`、`fuser` 共 4 个模块成功量化，量化覆盖率 **4/6**。PTQ NDS = 0.5774（FP32 基线 0.5801，精度损失 0.27%）。
 
 ---
 
@@ -120,10 +120,10 @@ FP32 基准：**NDS = 0.5800，mAP = 0.5742**。PTQ 结果在 `results_ptq.log` 
 - 将 `range(len(inputs))` 替换为 `range(self.num_ins)`（`__init__` 中预计算的常量）
 - 新增 `patch_mmcv_for_fx()` 上下文管理器（在 `quant_ptq_minmax.py`），在 fx 追踪期间临时将 mmcv 的 `Conv2d`/`ConvTranspose2d`/`MaxPool2d`/`Linear` 包装层的 `forward` 替换为 PyTorch 原生父类版本，绕过 `if x.numel() == 0` 兼容性检查
 
-**2. `fuser`（ConvFuser 中的 `torch.cat(Proxy, ...)`）**
+**2. `fuser`（ConvFuser 中的 `torch.cat(Proxy, ...)`）** ✅ 已完成
 
-问题在于 `torch.cat` 接收的是一个包含 Proxy 的列表，fx 无法解析。  
-可以将 `torch.cat([a, b], dim=1)` 改写为显式拼接以避免 Proxy 列表问题，或在 `ConvFuser` 的 `forward` 里用 `@torch.fx.wrap` 包装 cat 操作。
+问题：`torch.cat(inputs, dim=1)` 中 `inputs` 是一个 Proxy 对象（代表列表），fx 无法将其展开。  
+修复：将 `torch.cat(inputs, dim=1)` 改为 `torch.cat([inputs[i] for i in range(len(self.in_channels))], dim=1)`，通过 `__getitem__` 索引让 fx 看到独立的 Proxy 对象。
 
 **3. `camera/backbone`（SwinTransformer 动态控制流）**
 
@@ -170,8 +170,7 @@ PyTorch 官方的 `torch.quantization.prepare` → `calibrate` → `torch.quanti
 
 ### 方案 E：仅量化 decoder 部分，其余保持 FP32（当前方案的最优化）
 
-当前方案已经量化了 `decoder/backbone`（SECOND）、`decoder/neck`（SECONDFPN）和 `camera/neck`（GeneralizedLSSFPN）。可以在此基础上：
-- 量化 `fuser`（ConvFuser，用方案 A.2 可修复）
+当前方案已经量化了 `decoder/backbone`（SECOND）、`decoder/neck`（SECONDFPN）、`camera/neck`（GeneralizedLSSFPN）和 `fuser`（ConvFuser）。剩余可尝试的扩展：
 
 这两个修复工作量最小，收益相对明显（fuser 和 decoder/neck 合计参数量不小），是性价比最高的扩展路径。
 
@@ -183,11 +182,10 @@ PyTorch 官方的 `torch.quantization.prepare` → `calibrate` → `torch.quanti
 
 **1. 量化覆盖率待进一步提升**
 
-当前 3/6 模块已量化（`decoder/backbone`、`decoder/neck`、`camera/neck`）。剩余 3 个模块按修复难度：
+当前 4/6 模块已量化（`decoder/backbone`、`decoder/neck`、`camera/neck`、`fuser`）。剩余 2 个模块：
 
 | 难度 | 模块 | 原因 | 修复思路 |
 |------|------|------|---------|
-| 中等 | `fuser`（ConvFuser） | `Proxy + cat()` | 改写 cat 调用方式 |
 | 困难 | `camera/backbone`（SwinTransformer） | 动态控制流 | 传 `concrete_args` 固定输入尺寸 |
 | 困难 | `heads/object`（TransFusionHead） | Proxy 被迭代 | 展开 ModuleList 或包装函数 |
 

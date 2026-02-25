@@ -29,7 +29,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 | 脚本 | 状态 | 结果 |
 |------|------|------|
 | `tools/test.py` | ✅ | NDS = 0.5800 |
-| `tools/quant_ptq_minmax.py` | ✅ | NDS = 0.5799（PTQ 3/6 模块量化，精度无损） |
+| `tools/quant_ptq_minmax.py` | ✅ | NDS = 0.5774（PTQ 4/6 模块量化，精度损失 0.27%） |
 | `tools/quant_benchmark.py` | ✅ | 可运行 |
 | `tools/train.py` | ⚠️ | NaN 修复已应用但未验证 |
 | `tools/quant_train.py` | ⚠️ | 脚本已修复但未测试 |
@@ -62,9 +62,8 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 1. ~~**简单**：`decoder/neck`（SECONDFPN）和 `camera/neck`（GeneralizedLSSFPN）~~ ✅ 已完成
    - 修复：移除 Proxy 上的 `len()` 调用，改用 `self.num_ins` 等常量；新增 `patch_mmcv_for_fx()` 绕过 mmcv 包装层
 
-2. **中等**：`fuser`（ConvFuser）
-   - 原因：`torch.cat([feat_camera, feat_lidar], dim=1)` 中列表含 Proxy 对象
-   - 修复：改写 cat 调用，或用 `torch.fx.wrap` 包装
+2. ~~**中等**：`fuser`（ConvFuser）~~ ✅ 已完成
+   - 修复：将 `torch.cat(inputs, dim=1)` 改为 `torch.cat([inputs[i] for i in range(len(self.in_channels))], dim=1)`，让 fx 看到独立的 Proxy 对象而非代表列表的单个 Proxy
 
 3. **困难**：`camera/backbone`（SwinTransformer）、`heads/object`（TransFusionHead）
    - 见 PTQ_BENCHMARK_NOTES.md 的详细分析
