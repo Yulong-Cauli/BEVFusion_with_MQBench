@@ -210,6 +210,52 @@ fp16:
 **成功量化**：`decoder/backbone`（SECOND 稀疏卷积 backbone）。
 
 
+---
+
+## 2026-02-25 · 扩大 PTQ 量化覆盖（decoder/neck + camera/neck）
+
+**目标**：修复 `decoder/neck`（SECONDFPN）和 `camera/neck`（GeneralizedLSSFPN）的 `torch.fx` 追踪问题，使其可被 MQBench PTQ 量化。
+
+### 问题分析
+
+原始修复方案（`torch.fx.wrap('len')`）测试后发现**不可行**：
+
+1. `torch.fx.wrap('len')` 会拦截**所有** `len()` 调用（包括对普通 Python 列表的调用），导致 `len(laterals)` 返回 Proxy → `range(Proxy)` 报 `TypeError`。
+2. SECONDFPN 的真正阻断点不是 `len()`，而是 mmcv 的 `ConvTranspose2d` 包装层（`mmcv.cnn.bricks.wrappers`）中的 `if x.numel() == 0 and obsolete_torch_version(...):`，在 fx 追踪时 `x.numel()` 返回 Proxy → `if Proxy:` 触发 `TraceError`。
+
+### 修复内容
+
+| # | 文件 | 修改 |
+|---|------|------|
+| 1 | `mmdet3d/models/necks/second.py` | 移除 `assert len(x) == len(self.in_channels)`（Proxy 上调用 `len()` 不兼容 fx） |
+| 2 | `mmdet3d/models/necks/generalized_lss.py` | 移除 `assert len(inputs) == ...`；将 `range(len(inputs))` 改为 `range(self.num_ins)`（使用 `__init__` 中预计算的具体整数值） |
+| 3 | `tools/quant_ptq_minmax.py` | 新增 `patch_mmcv_for_fx()` 上下文管理器，在 fx 追踪期间临时将 mmcv 的 `Conv2d` / `ConvTranspose2d` / `MaxPool2d` / `Linear` 包装层的 `forward` 替换为 PyTorch 原生父类版本，绕过 `x.numel() == 0` 检查 |
+
+### 验证结果
+
+| 指标 | 修改前 | 修改后 |
+|------|--------|--------|
+| FP32 NDS | 0.5801 | 0.5801（无回归） |
+| PTQ NDS | 0.5802 | 0.5799（无回归） |
+| 量化成功模块数 | 1/6 | **3/6** |
+
+量化覆盖变化：
+
+| 子模块 | 修改前 | 修改后 |
+|--------|--------|--------|
+| `camera/backbone` | ❌ | ❌（SwinTransformer 动态控制流） |
+| `camera/neck` | ❌ | ✅ |
+| `fuser` | ❌ | ❌（Proxy + cat 冲突） |
+| `decoder/backbone` | ✅ | ✅ |
+| `decoder/neck` | ❌ | ✅ |
+| `heads/object` | ❌ | ❌（Proxy 迭代） |
+
+### 关键经验
+
+- **不要用 `torch.fx.wrap('len')`**：它全局拦截所有 `len()` 调用，包括对普通列表的调用，导致连锁失败。正确做法是用 `self.num_ins` 等 `__init__` 中预计算的常量替代 `len(input)` 调用。
+- **mmcv 包装层是隐藏的 fx 阻断点**：mmcv 的 `Conv2d` / `ConvTranspose2d` 等包装类在 `forward` 中有 `if x.numel() == 0` 的兼容性检查（面向 PyTorch < 1.4），在 fx 追踪时会触发 `TraceError`。需要在追踪前临时 monkey-patch 为原生 PyTorch 父类版本。
+
+
 
 
 
