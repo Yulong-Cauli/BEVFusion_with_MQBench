@@ -20,4 +20,4 @@ class ConvFuser(nn.Sequential):
         )
 
     def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
-        return super().forward(torch.cat(inputs, dim=1))
+        return super().forward(torch.cat([inputs[i] for i in range(len(self.in_channels))], dim=1))
