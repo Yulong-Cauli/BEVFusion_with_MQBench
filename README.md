@@ -27,7 +27,8 @@
 |------|------|
 | `tools/quant_ptq_minmax.py` | **PTQ** — MinMax 校准 + 精度评估 |
 | `tools/quant_benchmark.py` | **Benchmark** — 模型大小与推理延迟测量 |
-| `tools/trt_export_fuser.py` | **TRT 导出** — ConvFuser ONNX → TensorRT 引擎 |
+| `tools/trt_export_fuser.py` | **TRT 导出** — ConvFuser ONNX → TensorRT 隔离延迟测试 |
+| `tools/trt_eval_hybrid.py` | **TRT 评估** — TRT 替换 ConvFuser + 完整 NDS 端到端评估 |
 
 目标后端：**NVIDIA TensorRT INT8**
 
@@ -239,6 +240,19 @@ ConvFuser 单模块 TRT 导出验证（RTX 4060 Laptop，TensorRT 10.15）：
 | TRT FP16 | 1.44 ms | **3.54x** | 1543 KB | 3.49x |
 | TRT INT8 | 0.75 ms | **6.81x** | 832 KB | **6.48x** |
 
+### TRT Hybrid 端到端 NDS 评估
+
+ConvFuser 替换为 TRT 引擎后的完整端到端 NDS 评估（81 样本）：
+
+| 方法 | NDS | mAP | NDS 变化 |
+|------|------|------|---------|
+| PyTorch FP32 | 0.5801 | 0.5746 | — |
+| TRT FP32 | **0.5801** | **0.5746** | **+0.0000** |
+| TRT FP16 | **0.5799** | **0.5744** | **−0.0002** |
+| TRT INT8 | **0.5727** | **0.5616** | **−0.0074** |
+
+> ✅ TRT FP16 推荐：兼顾精度（无损）与 3.49x 压缩。INT8 精度下降 1.3%，主因是 ConvFuser 输出动态范围大。
+
 详细结果见 [docs/RESULTS_LOG.md](docs/RESULTS_LOG.md)。
 
 ---
@@ -284,10 +298,39 @@ python tools/quant_benchmark.py \
 MQBench 的 `convert_deploy` 和 `torch.onnx.export` 均无法直接导出 FakeQuant 模型（PyTorch 1.10 缺少自定义 op 的 ONNX symbolic）。实际可行的方案：
 
 ```
-FP32 PyTorch 模型 → torch.onnx.export → FP32 ONNX → TRT IInt8MinMaxCalibrator → INT8 引擎
+FP32 PyTorch 模型 → torch.onnx.export → FP32 ONNX → TRT INT8/FP16 校准 → TRT 引擎
 ```
 
-参考脚本：`tools/trt_export_fuser.py`（ConvFuser PoC，验证 6.81x INT8 加速）。
+### 可用脚本
+
+| 脚本 | 功能 | 状态 |
+|------|------|------|
+| `tools/trt_export_fuser.py` | ConvFuser 单模块导出 + 隔离延迟测试 | ✅ 已验证 |
+| `tools/trt_eval_hybrid.py` | TRT 替换 ConvFuser + 完整 NDS 评估 | ✅ 已验证 |
+
+### 使用方法
+
+```bash
+# 隔离延迟测试（ConvFuser）
+python tools/trt_export_fuser.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    pretrained/bevfusion-det.pth
+
+# 端到端 NDS 评估（TRT INT8 替换 ConvFuser）
+python tools/trt_eval_hybrid.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    pretrained/bevfusion-det.pth --eval bbox --precision int8
+
+# TRT FP16（推荐，精度无损）
+python tools/trt_eval_hybrid.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    pretrained/bevfusion-det.pth --eval bbox --precision fp16
+
+# 开启调试模式（逐样本对比 PyTorch vs TRT 输出）
+python tools/trt_eval_hybrid.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    pretrained/bevfusion-det.pth --eval bbox --precision fp32 --debug
+```
 
 ### 依赖
 
@@ -295,14 +338,15 @@ FP32 PyTorch 模型 → torch.onnx.export → FP32 ONNX → TRT IInt8MinMaxCalib
 pip install tensorrt onnx onnxruntime
 ```
 
-### 端到端 Hybrid 推理（开发中）
+### 架构
 
-计划将 4 个已量化子模块分别导出为 TRT INT8 引擎，其余保持 PyTorch 执行：
+Hybrid 推理将 ConvFuser 替换为 TRT 引擎，其余保持 PyTorch 执行：
 
 | 组件 | 运行方式 |
 |------|---------|
-| camera/neck, fuser, decoder/backbone, decoder/neck | → TRT INT8 引擎 |
-| camera/backbone, camera/vtransform, lidar/*, heads/* | → PyTorch FP32 |
+| fuser (ConvFuser) | → TRT FP16/INT8 引擎 |
+| camera/backbone, camera/neck, camera/vtransform | → PyTorch FP32 |
+| lidar/*, decoder/*, heads/* | → PyTorch FP32 |
 
 ---
 

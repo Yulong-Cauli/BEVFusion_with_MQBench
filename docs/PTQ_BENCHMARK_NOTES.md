@@ -232,9 +232,23 @@ NVIDIA 有 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_AI_Solution/t
 
 `configs/default.yaml` 加了 `init_scale: 512`，但没有实际跑训练确认 `grad_norm` 不再出现 NaN。
 
+### ✅ 已解决
+
+**TRT Hybrid 端到端评估已验证**
+
+`tools/trt_eval_hybrid.py` 已修复并通过验证。之前 NDS=0.0 的 bug 根因是 `FuserForExport` 与 `model.fuser` 共享参数引用，`.cpu()` 导出时破坏了原模型。修复：`copy.deepcopy` + 默认 CUDA 流 + `clone()` 输出。
+
+| 方法 | NDS | mAP | NDS 变化 |
+|------|------|------|---------|
+| PyTorch FP32 | 0.5801 | 0.5746 | — |
+| TRT FP32 | 0.5801 | 0.5746 | +0.0000 |
+| TRT FP16 | 0.5799 | 0.5744 | −0.0002 |
+| TRT INT8 | 0.5727 | 0.5616 | −0.0074 |
+
 ### 优先级建议
 
-- 目标是**看到真实 INT8 部署效果** → ✅ ConvFuser PoC 已完成（6.81x 加速）。下一步推广到 decoder/backbone、decoder/neck、camera/neck，编写 Hybrid Runner 整合端到端推理
+- ✅ ConvFuser TRT Hybrid 端到端评估已完成：FP16 无损，INT8 精度下降 1.3%
+- 目标是**推广到更多模块** → 将 decoder/backbone、decoder/neck、camera/neck 也导出为 TRT 引擎
 - 目标是**进一步扩大量化覆盖** → 尝试 `camera/backbone`（SwinTransformer）和 `heads/object`（TransFusionHead），均为困难级别
 - 目标是**跑通训练流程** → 验证 `train.py`（问题 3）
 

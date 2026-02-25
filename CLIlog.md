@@ -448,6 +448,29 @@ python tools/quant_ptq_minmax.py `
 
 ---
 
+**日期:** 2025-07-22
+
+**修复 TRT Hybrid 端到端评估 NDS=0.0 Bug**
+
+- **问题描述**: `tools/trt_eval_hybrid.py` 对所有精度（FP32/FP16/INT8）都返回 NDS=0.0，但同一脚本中纯 PyTorch 基线 NDS=0.5802 正常。
+- **根因**: `FuserForExport(model.fuser)` 持有对 `model.fuser` 子模块的**引用**（而非副本）。ONNX 导出时 `wrapper.cpu()` 将原模型 fuser 的参数搬到了 CPU，导致后续 CUDA 推理时 fuser 输出全零。
+- **修复方案**:
+  1. `FuserForExport.__init__` 使用 `copy.deepcopy(model.fuser)` 隔离导出权重
+  2. `TRTFuser` 使用 `torch.cuda.current_stream()` 代替自定义 `torch.cuda.Stream()`
+  3. `TRTFuser.forward()` 返回 `self._output_buf.clone()` 防止缓冲区复用问题
+  4. 重排流程：ONNX 导出在校准/推理之前进行
+  5. 新增 `--debug` 参数用于逐样本 PyTorch vs TRT 对比
+- **验证结果**:
+
+  | 方法 | NDS | mAP |
+  |------|------|------|
+  | PyTorch FP32 | 0.5801 | 0.5746 |
+  | TRT FP32 | 0.5801 | 0.5746 |
+  | TRT FP16 | 0.5799 | 0.5744 |
+  | TRT INT8 | 0.5727 | 0.5616 |
+
+---
+
 **日期:** 2026-02-21-16:46
 
 **成功解决 Windows 编码与环境问题**

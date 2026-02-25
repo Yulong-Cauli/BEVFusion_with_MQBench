@@ -119,6 +119,57 @@ python tools/quant_benchmark.py `
 
 ---
 
+## 7. TRT Hybrid 端到端 NDS 评估
+
+**数据来源**：RESULTS_LOG「TensorRT Hybrid 端到端 NDS 评估」
+
+> 前提：已安装 TensorRT（`pip install tensorrt`）
+
+### FP32 精度
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/trt_eval_hybrid.py `
+    --precision fp32 `
+    --calib-samples 128 2>&1 | Tee-Object -FilePath "results_trt_hybrid_fp32.log"
+```
+
+**预期输出**：NDS ≈ 0.5801, mAP ≈ 0.5746
+
+### FP16 精度
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/trt_eval_hybrid.py `
+    --precision fp16 `
+    --calib-samples 128 2>&1 | Tee-Object -FilePath "results_trt_hybrid_fp16.log"
+```
+
+**预期输出**：NDS ≈ 0.5799, mAP ≈ 0.5744
+
+### INT8 精度
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/trt_eval_hybrid.py `
+    --precision int8 `
+    --calib-samples 128 2>&1 | Tee-Object -FilePath "results_trt_hybrid_int8.log"
+```
+
+**预期输出**：NDS ≈ 0.5727, mAP ≈ 0.5616
+
+### 调试模式（逐样本对比 PyTorch vs TRT）
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/trt_eval_hybrid.py `
+    --precision int8 `
+    --calib-samples 128 `
+    --debug 2>&1 | Tee-Object -FilePath "results_trt_hybrid_debug.log"
+```
+
+---
+
 ## 日志文件说明
 
 运行完成后，所有结果日志保存在项目根目录：
@@ -131,3 +182,7 @@ python tools/quant_benchmark.py `
 | `results_trt_fuser.log` | TRT FP32/FP16/INT8 延迟 / 大小 |
 | `results_trt_accuracy.log` | TRT 各精度余弦相似度 |
 | `results_size.log` | 模型参数量 / 内存大小 |
+| `results_trt_hybrid_fp32.log` | TRT Hybrid FP32 端到端 NDS |
+| `results_trt_hybrid_fp16.log` | TRT Hybrid FP16 端到端 NDS |
+| `results_trt_hybrid_int8.log` | TRT Hybrid INT8 端到端 NDS |
+| `results_trt_hybrid_debug.log` | TRT Hybrid 调试模式输出 |

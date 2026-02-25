@@ -32,8 +32,8 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 | `tools/quant_ptq_minmax.py` | ✅ | NDS = 0.5810（PTQ 4/6 模块量化，精度无损，+0.0009 vs FP32） |
 | `tools/quant_benchmark.py` | ✅ | 可运行 |
 | `tools/trt_export_fuser.py` | ✅ | ConvFuser TRT PoC：INT8 6.81x 加速 |
+| `tools/trt_eval_hybrid.py` | ✅ | TRT Hybrid 端到端评估：FP32 NDS=0.5801, FP16 NDS=0.5799, INT8 NDS=0.5727 |
 | `tools/train.py` | ⚠️ | NaN 修复已应用但未验证 |
-| `tools/trt_export_fuser.py` | ✅ | ConvFuser TRT PoC：INT8 6.81x 加速 |
 
 ## 关键约束（务必遵守）
 

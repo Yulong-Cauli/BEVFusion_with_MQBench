@@ -1,5 +1,5 @@
 """
-Hybrid TRT Evaluation: Replace ConvFuser with TRT INT8 engine,
+Hybrid TRT Evaluation: Replace ConvFuser with TRT engine,
 run full NDS evaluation on nuScenes to measure end-to-end accuracy impact.
 
 Usage:
@@ -39,12 +39,14 @@ H, W = 180, 180  # BEV grid size
 
 
 class FuserForExport(nn.Module):
-    """ONNX export wrapper: list input -> two separate tensor args."""
+    """ONNX export wrapper: list input -> two separate tensor args.
+    Uses deepcopy to avoid corrupting the original model's fuser params."""
     def __init__(self, fuser):
         super().__init__()
-        self.conv = fuser[0]
-        self.bn = fuser[1]
-        self.relu = fuser[2]
+        fuser_copy = copy.deepcopy(fuser)
+        self.conv = fuser_copy[0]
+        self.bn = fuser_copy[1]
+        self.relu = fuser_copy[2]
 
     def forward(self, camera_bev, lidar_bev):
         x = torch.cat([camera_bev, lidar_bev], dim=1)
@@ -52,8 +54,9 @@ class FuserForExport(nn.Module):
 
 
 class TRTFuser(nn.Module):
-    """Drop-in replacement for ConvFuser using TRT engine."""
-    def __init__(self, engine_path):
+    """Drop-in replacement for ConvFuser using TRT engine.
+    Uses PyTorch's default CUDA stream and returns cloned output."""
+    def __init__(self, engine_path, ref_fuser=None):
         super().__init__()
         import tensorrt as trt
         self.logger = trt.Logger(trt.Logger.WARNING)
@@ -61,8 +64,9 @@ class TRTFuser(nn.Module):
         with open(engine_path, 'rb') as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
-        self.stream = torch.cuda.Stream()
         self._output_buf = None
+        self._ref_fuser = ref_fuser  # optional PyTorch fuser for debug comparison
+        self._call_count = 0
 
     def forward(self, inputs):
         camera_bev = inputs[0].contiguous()
@@ -74,7 +78,6 @@ class TRTFuser(nn.Module):
                 B, 256, H, W, device=camera_bev.device, dtype=torch.float32
             ).contiguous()
 
-        # Ensure FP32 for TRT
         if camera_bev.dtype != torch.float32:
             camera_bev = camera_bev.float().contiguous()
         if lidar_bev.dtype != torch.float32:
@@ -83,9 +86,31 @@ class TRTFuser(nn.Module):
         self.context.set_tensor_address('camera_bev', int(camera_bev.data_ptr()))
         self.context.set_tensor_address('lidar_bev', int(lidar_bev.data_ptr()))
         self.context.set_tensor_address('fused_bev', int(self._output_buf.data_ptr()))
-        self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
-        self.stream.synchronize()
-        return self._output_buf
+
+        # Use PyTorch's current CUDA stream to avoid inter-stream sync issues
+        stream = torch.cuda.current_stream()
+        self.context.execute_async_v3(stream_handle=stream.cuda_stream)
+        torch.cuda.synchronize()
+
+        # Clone to avoid downstream code referencing a reused buffer
+        result = self._output_buf.clone()
+
+        # Debug: compare against reference PyTorch fuser for first 5 samples
+        if self._ref_fuser is not None and self._call_count < 5:
+            with torch.no_grad():
+                ref_out = self._ref_fuser(inputs)
+            cos = torch.nn.functional.cosine_similarity(
+                result.flatten().unsqueeze(0),
+                ref_out.flatten().unsqueeze(0)
+            ).item()
+            diff = (result - ref_out).abs()
+            print(f'  [DEBUG sample {self._call_count}] '
+                  f'cos={cos:.6f}, maxErr={diff.max():.4f}, '
+                  f'PT[{ref_out.min():.2f},{ref_out.max():.2f}] '
+                  f'TRT[{result.min():.2f},{result.max():.2f}]')
+        self._call_count += 1
+
+        return result
 
 
 def make_calibrator(calib_data, cache_file):
@@ -175,6 +200,8 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--skip-baseline', action='store_true',
                         help='Skip PyTorch FP32 baseline evaluation')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable per-sample debug comparison')
     return parser.parse_args()
 
 
@@ -220,9 +247,66 @@ def main():
     model.eval()
     print(f'\n[1/5] Model loaded: {args.checkpoint}')
 
-    # ========== 2. FP32 Baseline (optional) ==========
+    # ========== 2. Export ONNX (BEFORE any inference, using deepcopy) ==========
+    print(f'\n[2/5] Exporting ONNX (from fresh model, no shared refs)...')
+    wrapper = FuserForExport(model.fuser)  # uses deepcopy internally
+    wrapper.eval().cpu()
+    onnx_path = os.path.join(out_dir, 'fuser_hybrid.onnx')
+    dummy_a = torch.randn(1, 80, H, W)
+    dummy_b = torch.randn(1, 256, H, W)
+    torch.onnx.export(
+        wrapper, (dummy_a, dummy_b), onnx_path,
+        input_names=['camera_bev', 'lidar_bev'],
+        output_names=['fused_bev'],
+        opset_version=13, do_constant_folding=True,
+    )
+    del wrapper
+    print(f'  ONNX exported: {onnx_path}')
+
+    # Verify model.fuser is still on correct device (deepcopy prevents corruption)
+    fuser_device = next(model.fuser.parameters()).device
+    print(f'  model.fuser device after export: {fuser_device}')
+
+    # ========== 3. Collect calibration data + FP32 baseline ==========
+    calib_data = []
+    if args.precision == 'int8':
+        print(f'\n[3/5] Collecting {args.calib_samples} calibration samples...')
+        fuser_stats = {'min_a': float('inf'), 'max_a': float('-inf'),
+                       'min_b': float('inf'), 'max_b': float('-inf')}
+
+        def hook_fn(module, inputs, output):
+            feat_list = inputs[0]
+            a = feat_list[0].detach().cpu().float()
+            b = feat_list[1].detach().cpu().float()
+            calib_data.append((a, b))
+            fuser_stats['min_a'] = min(fuser_stats['min_a'], a.min().item())
+            fuser_stats['max_a'] = max(fuser_stats['max_a'], a.max().item())
+            fuser_stats['min_b'] = min(fuser_stats['min_b'], b.min().item())
+            fuser_stats['max_b'] = max(fuser_stats['max_b'], b.max().item())
+
+        hook = model.fuser.register_forward_hook(hook_fn)
+        model_calib = MMDataParallel(model, device_ids=[0])
+
+        with torch.no_grad():
+            for i, data in enumerate(data_loader):
+                if i >= args.calib_samples:
+                    break
+                model_calib(**data, return_loss=False)
+                if (i + 1) % 10 == 0:
+                    print(f'  Collected {i+1}/{args.calib_samples}')
+
+        hook.remove()
+        del model_calib
+        torch.cuda.empty_cache()
+
+        print(f'  Camera BEV range: [{fuser_stats["min_a"]:.4f}, {fuser_stats["max_a"]:.4f}]')
+        print(f'  Lidar BEV range:  [{fuser_stats["min_b"]:.4f}, {fuser_stats["max_b"]:.4f}]')
+        print(f'  Calibration shapes: camera={calib_data[0][0].shape}, lidar={calib_data[0][1].shape}')
+    else:
+        print(f'\n[3/5] Skipping calibration (precision={args.precision})')
+
     if not args.skip_baseline:
-        print('\n[2/5] Running PyTorch FP32 baseline...')
+        print('\n  Running PyTorch FP32 baseline...')
         model_dp = MMDataParallel(copy.deepcopy(model), device_ids=[0])
         outputs_fp32 = single_gpu_test(model_dp, data_loader)
         eval_kwargs = cfg.get('evaluation', {}).copy()
@@ -234,64 +318,12 @@ def main():
         print(result_fp32)
         del model_dp
         torch.cuda.empty_cache()
-    else:
-        print('\n[2/5] Skipping FP32 baseline (--skip-baseline)')
 
-    # ========== 3. Collect calibration data ==========
-    print(f'\n[3/5] Collecting {args.calib_samples} calibration samples...')
-    calib_data = []
-    fuser_stats = {'min_a': float('inf'), 'max_a': float('-inf'),
-                   'min_b': float('inf'), 'max_b': float('-inf')}
-
-    def hook_fn(module, inputs, output):
-        feat_list = inputs[0]  # List[Tensor]: [camera_bev, lidar_bev]
-        a = feat_list[0].detach().cpu().float()
-        b = feat_list[1].detach().cpu().float()
-        calib_data.append((a, b))
-        fuser_stats['min_a'] = min(fuser_stats['min_a'], a.min().item())
-        fuser_stats['max_a'] = max(fuser_stats['max_a'], a.max().item())
-        fuser_stats['min_b'] = min(fuser_stats['min_b'], b.min().item())
-        fuser_stats['max_b'] = max(fuser_stats['max_b'], b.max().item())
-
-    hook = model.fuser.register_forward_hook(hook_fn)
-    model_calib = MMDataParallel(model, device_ids=[0])
-
-    with torch.no_grad():
-        for i, data in enumerate(data_loader):
-            if i >= args.calib_samples:
-                break
-            model_calib(**data, return_loss=False)
-            if (i + 1) % 10 == 0:
-                print(f'  Collected {i+1}/{args.calib_samples}')
-
-    hook.remove()
-    del model_calib
-    torch.cuda.empty_cache()
-
-    print(f'  Camera BEV range: [{fuser_stats["min_a"]:.4f}, {fuser_stats["max_a"]:.4f}]')
-    print(f'  Lidar BEV range:  [{fuser_stats["min_b"]:.4f}, {fuser_stats["max_b"]:.4f}]')
-    print(f'  Calibration samples shape: camera={calib_data[0][0].shape}, lidar={calib_data[0][1].shape}')
-
-    # ========== 4. Export ONNX + Build TRT engine ==========
-    print(f'\n[4/5] Exporting ONNX + building TRT {args.precision.upper()} engine...')
-
-    wrapper = FuserForExport(model.fuser)
-    wrapper.eval().cpu()
-    onnx_path = os.path.join(out_dir, 'fuser_hybrid.onnx')
-    dummy_a = torch.randn(1, 80, H, W)
-    dummy_b = torch.randn(1, 256, H, W)
-    torch.onnx.export(
-        wrapper, (dummy_a, dummy_b), onnx_path,
-        input_names=['camera_bev', 'lidar_bev'],
-        output_names=['fused_bev'],
-        opset_version=13, do_constant_folding=True,
-    )
-    print(f'  ONNX exported: {onnx_path}')
-
+    # ========== 4. Build TRT engine ==========
+    print(f'\n[4/5] Building TRT {args.precision.upper()} engine...')
     calib = None
     if args.precision == 'int8':
         cache_file = os.path.join(out_dir, 'calibration_real.cache')
-        # Delete old cache to force re-calibration with real data
         if os.path.exists(cache_file):
             os.remove(cache_file)
         calib = make_calibrator(calib_data, cache_file)
@@ -301,16 +333,24 @@ def main():
         print('ERROR: Failed to build TRT engine!')
         return
 
-    # Sanity check: compare PyTorch vs TRT output on real calibration data
-    print('\n  Sanity check (PyTorch vs TRT on calibration data):')
+    # Sanity check: compare PyTorch vs TRT on calibration data (or synthetic)
+    print('\n  Sanity check (PyTorch vs TRT):')
+    model.cuda()  # ensure model is on CUDA
     trt_fuser_check = TRTFuser(engine_path)
-    original_fuser = model.fuser.cuda()
+    test_inputs = []
+    if calib_data:
+        for i in range(min(5, len(calib_data))):
+            test_inputs.append((calib_data[i][0].cuda().float(),
+                                calib_data[i][1].cuda().float()))
+    else:
+        for _ in range(3):
+            test_inputs.append((torch.randn(1, 80, H, W, device='cuda'),
+                                torch.randn(1, 256, H, W, device='cuda')))
+
     cos_sims = []
     with torch.no_grad():
-        for i in range(min(5, len(calib_data))):
-            a, b = calib_data[i]
-            a_gpu, b_gpu = a.cuda().float(), b.cuda().float()
-            pt_out = original_fuser([a_gpu, b_gpu])
+        for i, (a_gpu, b_gpu) in enumerate(test_inputs):
+            pt_out = model.fuser([a_gpu, b_gpu])
             trt_out = trt_fuser_check([a_gpu, b_gpu])
             cos = torch.nn.functional.cosine_similarity(
                 pt_out.flatten().unsqueeze(0), trt_out.flatten().unsqueeze(0)
@@ -329,13 +369,14 @@ def main():
 
     # ========== 5. Replace fuser + Evaluate ==========
     print(f'\n[5/5] Replacing fuser with TRT {args.precision.upper()} engine, running evaluation...')
-    trt_fuser = TRTFuser(engine_path)
 
-    # Replace fuser in model
+    # Keep reference fuser for debug comparison if requested
+    ref_fuser = copy.deepcopy(model.fuser).cuda() if args.debug else None
+
+    trt_fuser = TRTFuser(engine_path, ref_fuser=ref_fuser)
     model.fuser = trt_fuser
     model_dp = MMDataParallel(model, device_ids=[0])
 
-    # Time the evaluation
     start_time = time.perf_counter()
     outputs_trt = single_gpu_test(model_dp, data_loader)
     eval_time = time.perf_counter() - start_time
