@@ -1,6 +1,6 @@
 # BEVFusion + MQBench 量化工具集
 
-> 本项目在 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion)（基于 mmdetection3d）的基础上，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具，实现了面向 TensorRT INT8 后端的**训练后量化（PTQ）**与**量化感知训练（QAT）**。
+> 本项目在 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion)（基于 mmdetection3d）的基础上，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具，实现了面向 TensorRT INT8 后端的**训练后量化（PTQ）**。
 
 ---
 
@@ -11,23 +11,23 @@
 - [数据准备](#数据准备)
 - [预训练模型](#预训练模型)
 - [PTQ：训练后量化](#ptq训练后量化)
-- [QAT：量化感知训练](#qat量化感知训练)
+- [量化精度验证结果](#量化精度验证结果)
 - [Benchmark 工具](#benchmark-工具)
-- [推荐工作流](#推荐工作流)
 - [TensorRT 部署](#tensorrt-部署)
+- [文档索引](#文档索引)
 - [致谢](#致谢)
 
 ---
 
 ## 项目简介
 
-本项目以 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion)（多传感器融合自动驾驶感知模型）为基础，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具库，新增以下量化脚本：
+本项目以 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion) 为基础，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具库，新增以下量化脚本：
 
 | 脚本 | 功能 |
 |------|------|
-| `tools/quant_ptq_minmax.py` | **PTQ** — MinMax 校准，训练后量化 |
-| `tools/quant_train.py` | **QAT** — 量化感知训练，端到端微调 |
+| `tools/quant_ptq_minmax.py` | **PTQ** — MinMax 校准 + 精度评估 |
 | `tools/quant_benchmark.py` | **Benchmark** — 模型大小与推理延迟测量 |
+| `tools/trt_export_fuser.py` | **TRT 导出** — ConvFuser ONNX → TensorRT 引擎 |
 
 目标后端：**NVIDIA TensorRT INT8**
 
@@ -35,44 +35,64 @@
 
 ## 环境安装
 
-### 基础依赖
+### 已验证环境
+
+| 组件 | 版本 |
+|------|------|
+| Python | 3.8.20 |
+| PyTorch | 1.10.2+cu113 |
+| CUDA | 11.3 |
+| mmcv-full | 1.4.0 |
+| mmdet | 2.20.0 |
+| mmdet3d | 0.0.0（本地安装） |
+| MQBench | 0.0.6 |
+| torchpack | 0.3.1 |
+| nuscenes-devkit | 1.1.11 |
+| TensorRT | 10.15.1.29（可选，仅 TRT 导出需要） |
+| GPU | NVIDIA GeForce RTX 4060 Laptop GPU |
+
+### 安装步骤
 
 ```bash
-# Python 3.8（推荐）
-# CUDA 11.1 或 11.3，PyTorch 1.9.0 ~ 1.10.2
-
+# 1. 安装 PyTorch（CUDA 11.3）
 pip install torch==1.10.2+cu113 torchvision==0.11.3+cu113 \
     -f https://download.pytorch.org/whl/torch_stable.html
 
+# 2. 安装 mmcv 和 mmdet
 pip install mmcv-full==1.4.0
 pip install mmdet==2.20.0
-pip install nuscenes-devkit
-pip install torchpack
-```
 
-### 安装本项目
+# 3. 安装其他依赖
+pip install nuscenes-devkit torchpack numba
 
-```bash
+# 4. 安装本项目（含 CUDA 扩展编译）
 python setup.py develop
-```
 
-> Windows 用户注意：如需重新编译 CUDA 扩展，需确保 Visual Studio 编译器环境可见。详见 [CLIlog.md](CLIlog.md)。
-
-### 安装 MQBench
-
-```bash
-# 从 PyPI 安装
+# 5. 安装 MQBench
 pip install mqbench
 
-# 验证安装
-python -c "import mqbench; print('MQBench 安装成功')"
+# 6.（可选）安装 TensorRT
+pip install tensorrt
+```
+
+### Windows 注意事项
+
+- **编码问题**：所有 Python 命令必须设置 `$env:PYTHONUTF8="1"`，否则读取 YAML 配置时会报 GBK codec 错误
+- **CUDA 编译**：如需重新编译 CUDA 扩展，需先激活 Visual Studio 编译器环境（`vcvars64.bat`）
+- 详细的环境修复记录见 [CLIlog.md](CLIlog.md)
+
+```powershell
+# Windows PowerShell 标准前置设置
+$env:PYTHONUTF8="1"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+conda activate bevfusion
 ```
 
 ---
 
 ## 数据准备
 
-本项目使用 [nuScenes](https://www.nuscenes.org/) 数据集。请按照 [mmdetection3d 文档](https://github.com/open-mmlab/mmdetection3d/blob/master/docs/en/datasets/nuscenes_det.md) 下载并预处理数据集。
+本项目使用 [nuScenes](https://www.nuscenes.org/) 数据集。
 
 预处理完成后，目录结构如下：
 
@@ -81,7 +101,7 @@ data/nuscenes/
 ├── maps/
 ├── samples/
 ├── sweeps/
-├── v1.0-trainval/
+├── v1.0-trainval/          # 或 v1.0-mini
 ├── nuscenes_infos_train.pkl
 ├── nuscenes_infos_val.pkl
 └── nuscenes_dbinfos_train.pkl
@@ -98,17 +118,11 @@ python tools/create_data.py nuscenes --root-path ./data/nuscenes \
 
 ## 预训练模型
 
-下载 BEVFusion 预训练权重：
-
-```bash
-./tools/download_pretrained.sh
-```
-
-或手动下载到 `pretrained/` 目录：
+下载 BEVFusion 预训练权重到 `pretrained/` 目录：
 
 | 文件 | 说明 |
 |------|------|
-| `bevfusion-det.pth` | BEVFusion 检测模型（Camera+LiDAR，nuScenes val mAP=68.52） |
+| `bevfusion-det.pth` | BEVFusion 检测模型（Camera+LiDAR） |
 | `swint-nuimages-pretrained.pth` | Swin Transformer Backbone 预训练权重 |
 
 ---
@@ -119,7 +133,7 @@ python tools/create_data.py nuscenes --root-path ./data/nuscenes \
 
 ### 原理
 
-PTQ（Post-Training Quantization）无需重新训练，仅需少量校准数据（几十到几百个 batch）即可确定量化参数。本项目采用 **MinMax 校准**策略：
+PTQ 无需重新训练，仅需少量校准数据即可确定量化参数。本项目采用 **MinMax 校准**策略：
 
 1. 对可量化子模块逐一调用 `prepare_by_platform`，插入 FakeQuantize 节点
 2. `enable_calibration`：在校准数据上前向推理，记录各层激活值的 min/max
@@ -127,31 +141,36 @@ PTQ（Post-Training Quantization）无需重新训练，仅需少量校准数据
 
 ### 选择性量化策略
 
-BEVFusion 包含自定义 CUDA 算子，不能对全模型直接量化，因此采用**选择性量化**：
+BEVFusion 包含自定义 CUDA 算子和动态控制流，不能对全模型直接量化，因此采用**选择性量化**：
 
-**✅ 可量化部分**（标准密集卷积，`torch.fx` 可追踪）：
+**✅ 已成功量化（4/6）**：
 
-| 子模块 | 说明 |
-|--------|------|
-| `encoders.camera.backbone` | 相机骨干网络（SwinTransformer / ResNet） |
-| `encoders.camera.neck` | 相机 Neck（GeneralizedLSSFPN / FPN） |
-| `fuser` | 多模态融合模块（ConvFuser） |
-| `decoder.backbone` | 解码器骨干（SECOND） |
-| `decoder.neck` | 解码器 Neck（SECONDFPN） |
-| `heads.*` | 检测 / 分割 Head |
+| 子模块 | 类型 | 说明 |
+|--------|------|------|
+| `decoder.backbone` | SECOND | 纯静态 Conv2d，fx 直接可追踪 |
+| `decoder.neck` | SECONDFPN | 已修复 `len()` 断言 + mmcv 包装层 |
+| `encoders.camera.neck` | GeneralizedLSSFPN | 已修复 `len()` 调用 + mmcv 包装层 |
+| `fuser` | ConvFuser | 已修复 `torch.cat(Proxy)` 问题 |
 
-**❌ 跳过部分**（含自定义 CUDA 算子或稀疏卷积）：
+**❌ 暂不支持（2/6）**：
+
+| 子模块 | 类型 | 失败原因 |
+|--------|------|----------|
+| `encoders.camera.backbone` | SwinTransformer | 含 `if tensor_value:` 动态控制流 |
+| `heads.object` | TransFusionHead | Proxy 对象被 for 循环迭代 |
+
+**⊘ 设计跳过**（非标准卷积，不适合 PTQ）：
 
 | 子模块 | 跳过原因 |
 |--------|----------|
-| `encoders.camera.vtransform` | 内含 `bev_pool`（QuickCumsumCuda）自定义 CUDA autograd Function |
+| `encoders.camera.vtransform` | 内含 `bev_pool`（QuickCumsumCuda）自定义 CUDA 算子 |
 | `encoders.lidar.voxelize` | 点云体素化预处理，非神经网络层 |
 | `encoders.lidar.backbone` | 稀疏卷积（SparseEncoder），FakeQuant 节点无法插入 |
 
 ### 使用方法
 
 ```bash
-# 单 GPU（默认 128 个校准 batch）
+# 校准 + 精度评估（推荐，约 3 分钟）
 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load_from pretrained/bevfusion-det.pth
@@ -162,23 +181,18 @@ python tools/quant_ptq_minmax.py \
     --load_from pretrained/bevfusion-det.pth \
     --calib-batches 256
 
-# 跳过精度评估（仅校准并保存）
+# 仅校准并保存（跳过精度评估）
 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load_from pretrained/bevfusion-det.pth \
     --no-eval
-
-# 多 GPU 分布式
-torchpack dist-run -np 8 python tools/quant_ptq_minmax.py \
-    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    --load_from pretrained/bevfusion-det.pth
 ```
+
+> ⚠️ PTQ checkpoint 的 `state_dict` 键名经 `torch.fx` 改造，**不能**用 `tools/test.py` 直接评估。精度评估请通过本脚本（不加 `--no-eval`）完成。
 
 ### 输出
 
 量化模型保存至 `runs/<run_dir>/ptq_minmax_model.pth`，包含量化后的权重与 scale/zero_point 参数。
-
-### 超参数说明
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -188,86 +202,44 @@ torchpack dist-run -np 8 python tools/quant_ptq_minmax.py \
 
 ---
 
-## QAT：量化感知训练
+## 量化精度验证结果
 
-**脚本**：`tools/quant_train.py`
+在 nuScenes v1.0-mini 验证集（81 样本）上，使用 128 batch 校准的完整 NDS 评估：
 
-### 原理
+| 指标 | FP32 基线 | PTQ 4/6（MinMax） | 变化 |
+|------|----------|------------------|------|
+| **NDS** | 0.5801 | **0.5810** | **+0.0009**（无损） |
+| **mAP** | 0.5742 | **0.5759** | **+0.0017**（无损） |
 
-QAT（Quantization-Aware Training）在训练时模拟量化效果，通过梯度反传更新权重，相比 PTQ 通常能获得更高精度。
+> ✅ 最朴素的 MinMax PTQ 在 4/6 模块量化后实现了**零精度损失**。
 
-**量化策略**（TensorRT INT8 后端）：
-- 权重：Per-channel 对称量化
-- 激活：Per-tensor 量化
-- 使用 Straight-Through Estimator (STE) 近似量化梯度
+<details>
+<summary>逐类 AP 详情</summary>
 
-### 关键概念：Leaf Modules
+| 类别 | FP32 | PTQ 4/6 | 变化 |
+|------|------|---------|------|
+| car | 0.916 | 0.918 | +0.002 |
+| truck | 0.833 | 0.840 | +0.007 |
+| bus | 0.995 | 0.995 | 0.000 |
+| pedestrian | 0.919 | 0.922 | +0.003 |
+| motorcycle | 0.705 | 0.699 | −0.006 |
+| bicycle | 0.517 | 0.518 | +0.001 |
+| traffic_cone | 0.848 | 0.866 | +0.018 |
 
-`torch.fx` 无法追踪包含自定义 CUDA 扩展的模块，必须将其标记为 **leaf modules**，让 `torch.fx` 将其视为不可分割的原子操作。
+</details>
 
-BEVFusion 中需要设为 leaf 的核心模块：
+### ConvFuser TensorRT 导出 PoC
 
-| 类别 | 模块 |
-|------|------|
-| BEV Pooling | `QuickCumsum`、`QuickCumsumCuda` |
-| 稀疏卷积 | `SparseModule`、`SparseConvolution`、`SparseMaxPool` 等 |
-| 体素化 | `Voxelization`、`DynamicScatter` |
-| 视图变换 | `BaseTransform`、`LSSTransform` |
-| 其他 | ROI Pooling、Point Sampling、PAConv、Group Points |
+ConvFuser 单模块 TRT 导出验证（RTX 4060 Laptop，TensorRT 10.15）：
 
-完整列表见 `tools/quant_train.py` 中的 `get_leaf_modules_for_mmdet3d()` 函数。
+| 精度 | 延迟 | 加速比 | 引擎大小 | 压缩比 |
+|------|------|--------|---------|--------|
+| PyTorch FP32 | 5.08 ms | 1.00x | — | — |
+| TRT FP32 | 4.02 ms | 1.27x | 5385 KB | 1.00x |
+| TRT FP16 | 1.44 ms | **3.54x** | 1543 KB | 3.49x |
+| TRT INT8 | 0.75 ms | **6.81x** | 832 KB | **6.48x** |
 
-### QAT 训练流程
-
-```
-浮点预训练模型
-    ↓ prepare_by_platform（插入 FakeQuantize 节点）
-    ↓ enable_calibration（收集激活统计信息）
-    ↓ enable_quantization（激活 FakeQuant）
-    ↓ QAT 微调（端到端梯度更新）
-    ↓ 保存量化模型
-```
-
-### 使用方法
-
-```bash
-# 单 GPU
-python tools/quant_train.py \
-    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    --load_from pretrained/bevfusion-det.pth
-
-# 多 GPU 分布式（推荐）
-torchpack dist-run -np 8 python tools/quant_train.py \
-    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    --load_from pretrained/bevfusion-det.pth \
-    --run-dir runs/qat_bevfusion
-```
-
-### 训练超参数建议
-
-| 参数 | 浮点训练 | QAT 建议值 | 说明 |
-|------|----------|-----------|------|
-| 学习率 | 2e-3 | **2e-4** | QAT 使用约 1/10 的学习率，避免破坏量化参数的稳定性 |
-| Epoch | 20 | **10~20** | QAT 收敛较快 |
-| Batch Size | 保持一致 | 保持一致 | 无需调整 |
-| 权重衰减 | 0.01 | 0.01 | 无需调整 |
-
-### 精度预期
-
-- 精度下降：绝对精度下降应控制在 **1~2 个百分点**以内（mAP / NDS）
-- 训练时间：8× A100 约 **2~4 小时**（20 epoch）
-- 显存占用：与浮点训练相当
-
-### 故障排除
-
-**`torch.fx` 追踪错误**（`RuntimeError: Could not run 'aten::xxx'`）  
-→ 在 `get_leaf_modules_for_mmdet3d()` 中添加对应模块类
-
-**精度下降过大（> 5%）**  
-→ 降低学习率至 1e-4；增加训练周期至 30 epoch；增加校准数据量
-
-**显存不足（OOM）**  
-→ 减小 `samples_per_gpu`；使用梯度累积；启用 gradient checkpointing
+详细结果见 [docs/RESULTS_LOG.md](docs/RESULTS_LOG.md)。
 
 ---
 
@@ -278,114 +250,71 @@ torchpack dist-run -np 8 python tools/quant_train.py \
 用于报告模型大小（参数量、FP32 内存、估算 INT8 大小）及测量 GPU 推理延迟，支持 FP32 与量化模型的横向对比。
 
 ```bash
-# 仅报告 FP32 模型大小（无需数据集）
+# 仅报告模型大小（无需数据集）
 python tools/quant_benchmark.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --checkpoint pretrained/bevfusion-det.pth \
     --size-only
 
-# 使用真实验证集数据测量推理延迟
+# 对比 FP32 与 PTQ 模型（延迟 + 大小）
 python tools/quant_benchmark.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --checkpoint pretrained/bevfusion-det.pth \
-    --use-real-data --num-iters 50
-
-# 对比 FP32 与量化模型
-python tools/quant_benchmark.py \
-    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    --checkpoint pretrained/bevfusion-det.pth \
-    --quant-checkpoint runs/ptq_minmax/ptq_minmax_model.pth \
-    --use-real-data --num-iters 50
+    --quant-checkpoint <ptq_checkpoint_path> \
+    --num-iters 30
 ```
 
-输出示例：
+实测结果（RTX 4060 Laptop，nuScenes v1.0-mini）：
 
-```
-============================================================
-  模型大小报告 [FP32]
-============================================================
-  可训练参数量:  69,838,336  (69.84 M)
-  FP32 内存占用: 266.45 MB
-  估算 INT8 大小: 66.61 MB  (FP32 / 4，仅供参考)
-============================================================
-  推理延迟报告 [FP32] (共 50 次)
-============================================================
-  均值:   125.34 ms
-  P95:    138.20 ms
-  FPS:    7.98
-============================================================
-```
+| 指标 | FP32 | PTQ（FakeQuant 仿真） |
+|------|------|----------------------|
+| 参数量 | 39.80 M | 39.81 M |
+| .pth 文件大小 | 156.13 MB | 156.31 MB |
+| 均值延迟 | 389 ms | 408 ms |
+| 理论 INT8 部署大小 | — | ~39 MB（需 TRT 导出） |
 
----
-
-## 推荐工作流
-
-```
-① 下载预训练浮点模型
-        ↓
-② PTQ MinMax（tools/quant_ptq_minmax.py）
-   快速获取量化基线，只需校准数据，无需训练
-        ↓
-③ 评估精度（tools/quant_ptq_minmax.py 不加 --no-eval）
-   检查 mAP / NDS 是否满足要求
-        ↓
-   精度可接受 ──→ ④ Benchmark（tools/quant_benchmark.py）
-                     测量推理速度，准备 TensorRT 部署
-        ↓
-   精度不足   ──→ ⑤ QAT（tools/quant_train.py）
-                     端到端微调恢复精度，再回到 ③
-```
-
-> ⚠️ PTQ checkpoint 的 `state_dict` 键名经 `torch.fx` 改造，**不能**直接用 `tools/test.py` 评估。精度评估请通过 `quant_ptq_minmax.py`（不加 `--no-eval`）完成。
-
-| 方法 | 脚本 | 精度 | 耗时 | 所需数据 |
-|------|------|------|------|----------|
-| PTQ MinMax | `quant_ptq_minmax.py` | ★★☆ | 最快（分钟级） | 少量校准集 |
-| QAT | `quant_train.py` | ★★★ | 较慢（小时级） | 完整训练集 |
-
----
-
-## 量化精度验证结果
-
-在 nuScenes v1.0-mini 验证集（81 样本）上进行完整 NDS 评估：
-
-| 指标 | FP32 基线 | PTQ 4/6（MinMax） | 变化 |
-|------|----------|------------------|------|
-| **NDS** | 0.5801 | **0.5810** | **+0.0009**（无损） |
-| **mAP** | 0.5742 | **0.5759** | **+0.0017**（无损） |
-
-PTQ 量化覆盖 4/6 子模块（decoder/backbone、decoder/neck、camera/neck、fuser），使用最朴素的 MinMax 校准即实现零精度损失。
-
-<details>
-<summary>逐类 AP 详情</summary>
-
-| 类别 | FP32 | PTQ 4/6 |
-|------|------|---------|
-| car | 0.916 | 0.918 |
-| truck | 0.833 | 0.840 |
-| bus | 0.995 | 0.995 |
-| pedestrian | 0.919 | 0.922 |
-| motorcycle | 0.705 | 0.699 |
-| bicycle | 0.517 | 0.518 |
-| traffic_cone | 0.848 | 0.866 |
-
-</details>
-
-ConvFuser 单模块 TensorRT 导出 PoC（RTX 4060 Laptop）：
-
-| 精度 | 延迟 | 加速比 | 引擎大小 | 压缩比 |
-|------|------|--------|---------|--------|
-| PyTorch FP32 | 5.08 ms | 1.00x | — | — |
-| TRT FP16 | 1.44 ms | **3.54x** | 1543 KB | 3.49x |
-| TRT INT8 | 0.75 ms | **6.81x** | 832 KB | **6.48x** |
-
-详细结果见 [docs/RESULTS_LOG.md](docs/RESULTS_LOG.md)。
+> FakeQuant 仿真在 FP32 上执行额外的 clamp/round 操作，本身有开销。真实 INT8 加速需要 TensorRT 引擎部署。
 
 ---
 
 ## TensorRT 部署
 
-量化模型可通过 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_AI_Solution/tree/master/CUDA-BEVFusion) 部署到 TensorRT，在 Jetson Orin 上实现约 **25 FPS** 的 INT8 推理。
+### 已验证方案
+
+MQBench 的 `convert_deploy` 和 `torch.onnx.export` 均无法直接导出 FakeQuant 模型（PyTorch 1.10 缺少自定义 op 的 ONNX symbolic）。实际可行的方案：
+
+```
+FP32 PyTorch 模型 → torch.onnx.export → FP32 ONNX → TRT IInt8MinMaxCalibrator → INT8 引擎
+```
+
+参考脚本：`tools/trt_export_fuser.py`（ConvFuser PoC，验证 6.81x INT8 加速）。
+
+### 依赖
+
+```bash
+pip install tensorrt onnx onnxruntime
+```
+
+### 端到端 Hybrid 推理（开发中）
+
+计划将 4 个已量化子模块分别导出为 TRT INT8 引擎，其余保持 PyTorch 执行：
+
+| 组件 | 运行方式 |
+|------|---------|
+| camera/neck, fuser, decoder/backbone, decoder/neck | → TRT INT8 引擎 |
+| camera/backbone, camera/vtransform, lidar/*, heads/* | → PyTorch FP32 |
+
+---
+
+## 文档索引
+
+| 文件 | 内容 |
+|------|------|
+| [docs/RESULTS_LOG.md](docs/RESULTS_LOG.md) | 所有评测结果记录（FP32 / PTQ 精度、速度、大小） |
+| [docs/PTQ_BENCHMARK_NOTES.md](docs/PTQ_BENCHMARK_NOTES.md) | 量化覆盖问题分析、TRT 导出方案、开放问题 |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | 可复现运行手册（所有命令） |
+| [CLIlog.md](CLIlog.md) | 完整历史修复记录（环境配置、bug 修复） |
+| [AGENTS.md](AGENTS.md) | Agent 工作说明（环境约束、已知问题） |
 
 ---
 
@@ -394,4 +323,3 @@ ConvFuser 单模块 TensorRT 导出 PoC（RTX 4060 Laptop）：
 - **BEVFusion**：[论文](https://arxiv.org/abs/2205.13542) | [代码](https://github.com/mit-han-lab/bevfusion)
 - **MQBench**：[代码](https://github.com/ModelTC/MQBench) | [文档](https://mqbench.readthedocs.io/)
 - **mmdetection3d**：[代码](https://github.com/open-mmlab/mmdetection3d)
-- **CUDA-BEVFusion**：[NVIDIA TensorRT 部署方案](https://github.com/NVIDIA-AI-IOT/Lidar_AI_Solution/tree/master/CUDA-BEVFusion)

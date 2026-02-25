@@ -33,7 +33,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 | `tools/quant_benchmark.py` | ✅ | 可运行 |
 | `tools/trt_export_fuser.py` | ✅ | ConvFuser TRT PoC：INT8 6.81x 加速 |
 | `tools/train.py` | ⚠️ | NaN 修复已应用但未验证 |
-| `tools/quant_train.py` | ⚠️ | 脚本已修复但未测试 |
+| `tools/trt_export_fuser.py` | ✅ | ConvFuser TRT PoC：INT8 6.81x 加速 |
 
 ## 关键约束（务必遵守）
 
@@ -69,9 +69,8 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 3. **困难**：`camera/backbone`（SwinTransformer）、`heads/object`（TransFusionHead）
    - 见 PTQ_BENCHMARK_NOTES.md 的详细分析
 
-### 次要：验证训练和 QAT
+### 次要：验证训练
 - 跑 `tools/train.py` 约 100 步确认 `grad_norm` 不再出现 NaN（已在 `configs/default.yaml` 加 `init_scale: 512`）
-- 跑 `tools/quant_train.py` 验证 QAT 能启动不崩溃
 
 ### 下一步：TensorRT INT8 导出（见 PTQ_BENCHMARK_NOTES.md 第五节问题 2）
 

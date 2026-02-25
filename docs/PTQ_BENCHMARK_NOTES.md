@@ -15,7 +15,8 @@
 | `decoder/neck` | SECONDFPN | ✅ 成功 | 已修复：移除 Proxy 上的 `len()` 断言 + `patch_mmcv_for_fx()` |
 | `heads/object` | TransFusionHead | ❌ 失败 | Proxy 对象被 for 循环迭代 |
 
-**结论**：`decoder/backbone`、`decoder/neck`、`camera/neck`、`fuser` 共 4 个模块成功量化，量化覆盖率 **4/6**。PTQ NDS = **0.5810**（FP32 基线 0.5801，精度无损，+0.0009）。
+**结论**：`decoder/backbone`、`decoder/neck`、`camera/neck`、`fuser` 共 4 个模块成功量化，量化覆盖率 **4/6**。
+PTQ NDS = **0.5810**（FP32 基线 0.5801，精度无损，+0.0009）。
 
 ---
 
@@ -24,7 +25,7 @@
 MQBench 的量化是"仿真量化"（Fake Quantization / QAT/PTQ 模拟），其本质是：
 
 - 权重仍以 **FP32** 存储，额外附加 `scale` / `zero_point` 参数
-- `.pth` 文件大小与 FP32 原始模型**几乎相同**（甚至略大）
+- `.pth` 文件大小与 FP32 原始模型**几乎相同**，甚至略大
 - 真正的 INT8 压缩（≈ FP32 / 4）需要将模型**导出到 TensorRT 引擎**后才能实现
 
 | 指标 | 数值 |
@@ -231,12 +232,10 @@ NVIDIA 有 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_AI_Solution/t
 
 `configs/default.yaml` 加了 `init_scale: 512`，但没有实际跑训练确认 `grad_norm` 不再出现 NaN。
 
-**4. `quant_train.py`（QAT）完全未测试**
-
-脚本修复已完成（dist、pretty_text、distributed flag），但从未端到端跑过一次。
-
 ### 优先级建议
 
 - 目标是**看到真实 INT8 部署效果** → ✅ ConvFuser PoC 已完成（6.81x 加速）。下一步推广到 decoder/backbone、decoder/neck、camera/neck，编写 Hybrid Runner 整合端到端推理
 - 目标是**进一步扩大量化覆盖** → 尝试 `camera/backbone`（SwinTransformer）和 `heads/object`（TransFusionHead），均为困难级别
-- 目标是**跑通完整训练流程** → 验证 `train.py`（问题 3）+ 跑一次 QAT（问题 4）
+- 目标是**跑通训练流程** → 验证 `train.py`（问题 3）
+
+> 注：QAT（`quant_train.py`）已移除。MinMax PTQ 精度无损（NDS +0.0009），无需 QAT 微调。
