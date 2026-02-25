@@ -1,16 +1,214 @@
 # 注意事项
 
-**cl 没有放在 系统环境变量里面。**如果涉及cl的操作记得运行类似的指令：
-
-cmd /c "call `"D:\Program Files\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat`" && powershell"
-
-如果修改了 C++ / CUDA 代码，或者需要重新运行 `setup.py develop`，您需要确保编译器环境可见。
+**cl 没有放在系统环境变量里面。** 如果涉及 cl 的操作，记得先运行：
 
 ```powershell
-# 设置构建变量 (仅编译时需要)
+cmd /c "call `"D:\Program Files\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat`" && powershell"
+```
+
+如果修改了 C++ / CUDA 代码，或者需要重新运行 `setup.py develop`，需要确保编译器环境可见：
+
+```powershell
 $env:DISTUTILS_USE_SDK=1
 $env:MSSdk=1
 ```
+
+**Windows 编码问题**：所有 Python 脚本必须加 `$env:PYTHONUTF8="1"`，否则读取 YAML 时会报 GBK codec 错误。
+
+```powershell
+# 1 测试原始 FP32 模型（基准分）
+$env:PYTHONUTF8="1"
+python tools/test.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml pretrained/bevfusion-det.pth --eval bbox
+
+# 2 PTQ 校准（128 batch，校准完成后自动保存量化模型）
+$env:PYTHONUTF8="1"
+python tools/quant_ptq_minmax.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml --load_from pretrained/bevfusion-det.pth --calib-batches 128
+
+# 3 评估 PTQ 量化模型跑分（先找到保存的文件，再评估）
+$env:PYTHONUTF8="1"
+$ptq_ckpt = (Get-ChildItem -Recurse -Filter "ptq_minmax_model.pth" | Sort-Object LastWriteTime -Descending |
+Select-Object -First 1).FullName
+Write-Host "PTQ model: $ptq_ckpt"
+python tools/test.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml $ptq_ckpt --eval bbox
+```
+
+   说明：2的 PTQ 脚本默认也会在最后跑一次 eval（除非加了
+  --no-eval），所以如果2跑完了直接出结果的话，3就不需要单独跑了。3是单独评估用的备用命令。
+
+---
+
+# 环境信息
+
+| 项目 | 值 |
+|------|-----|
+| Conda 环境 | `bevfusion` (`D:\aconda\envs\bevfusion`) |
+| PyTorch | 1.10.2+cu113 |
+| mmdet3d | 0.0.0（本地 `pip install -e .` 安装） |
+| MQBench | 0.0.6 |
+| mmdet | 2.20.0 |
+| Python | 3.8（Windows） |
+| CUDA | 11.3 |
+| mpi4py | **未安装**（torchpack 分布式需要，单 GPU 不需要） |
+
+**数据集**：`data/nuscenes`（Junction 符号链接 → `D:\Pytorchlib\data\nuscenes`），v1.0-mini。  
+**预训练权重**：`pretrained/bevfusion-det.pth`，`pretrained/swint-nuimages-pretrained.pth`。
+
+---
+
+# 运行命令（所有脚本均需设置 PYTHONUTF8）
+
+```powershell
+$env:PYTHONUTF8="1"
+
+# 测试（推理评估）
+python tools/test.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml pretrained/bevfusion-det.pth --eval bbox
+
+# PTQ（离线量化校准）
+python tools/quant_ptq_minmax.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml --load_from pretrained/bevfusion-det.pth --calib-batches 128
+
+# 训练
+python tools/train.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml
+
+# QAT（量化感知训练）
+python tools/quant_train.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml --load_from pretrained/bevfusion-det.pth
+
+# Benchmark（模型大小 / 推理速度）
+python tools/quant_benchmark.py configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml --checkpoint pretrained/bevfusion-det.pth --size-only
+```
+
+---
+
+# CLI 操作日志
+
+---
+
+## 2026-02-17 · 初始环境配置
+
+**数据集与预训练模型**
+
+- 数据集路径：`D:\Pytorchlib\data\nuscenes`，创建 Junction 符号链接映射到 `data/nuscenes`。
+- 下载预训练模型到 `pretrained/`：`bevfusion-det.pth`、`swint-nuimages-pretrained.pth`。
+
+**编译与 Import 修复**
+
+- 调用 `vcvars64.bat` 环境编译 CUDA 扩展（`setup.py develop`）。
+- 修复 `ImportError: cannot import name 'feature_decorator_ext'`：在 `mmdet3d/ops/__init__.py` 注释掉 `feature_decorator` 引用。
+- 在 `mmdet3d/models/backbones/__init__.py` 注释掉 `radar_encoder` 引用。
+
+**Pipeline / 配置修复**
+
+- 修复 `KeyError: 'radar'`：在 `configs/nuscenes/det/default.yaml` 中移除 `LoadRadarPointsMultiSweeps` 管道步骤及 `Collect3D` 中的 `radar` 键。
+- 修复因注释产生的 `None` 列表项导致的 `TypeError`。
+- 修复 `RuntimeError`（维度不匹配）：`mmdet3d/models/vtransforms/depth_lss.py` 强制设置 `add_depth_features=False`（`__init__` 中已写死，见下方 2026-02-25 补充）。
+
+---
+
+## 2026-02-20 · Windows 环境训练与测试修复
+
+**训练脚本（`tools/train.py` / `mmdet3d/apis/train.py`）**
+
+- 增加单 GPU（非分布式）检测与支持，修复 `num_gpus` 为 `None` 导致的 `TypeError`。
+- 非分布式模式下使用 `MMDataParallel` 替代 `MMDistributedDataParallel`。
+
+**配置调整**
+
+- `samples_per_gpu` 降为 1（解决 8GB 显存 OOM）。
+- 禁用 `TensorboardLoggerHook`（规避 `distutils` 兼容性错误）。
+
+**Tensor 类型修复**
+
+- `mmdet3d/core/bbox/assigners/hungarian_assigner.py`：强制 `gt_labels` 转 `long`，修复 `IndexError`。
+- `mmdet3d/models/heads/bbox/transfusion.py`：`gt_labels_3d` 转 `long`，修复 `RuntimeError: Index put requires ...`。
+
+**验证结果**
+
+- `train.py` 成功运行 450+ 迭代，loss 正常下降。
+- `test.py` 全量评估：**NDS = 0.5803**。
+
+---
+
+## 2026-02-21 · 路径变更后环境修复 & VS Code 配置
+
+**问题**：项目文件夹重命名导致编译产物路径失效，`ModuleNotFoundError: No module named 'mmcv'`。
+
+**修复**：删除 `build/`、`mmdet3d.egg-info/`、`dist/`，在新路径下重新 `pip install -e .`。
+
+**VS Code 调试配置**：创建 `.vscode/launch.json`，新增 `Python: Test BEVFusion` 配置，`env` 中加入 `"PYTHONUTF8": "1"`。
+
+---
+
+## 2026-02-25 · 重新配置环境 + MQBench PTQ 修复
+
+**背景**：Conda 环境重建（新机器/新路径），重新 `pip install -e .`。此次对所有脚本进行了系统性修复，使 `test.py` 和 `quant_ptq_minmax.py` 可在单 GPU / 无 MPI 环境下正常运行。
+
+### Numpy 兼容性修复（重装环境后发现）
+
+| 文件 | 修复内容 |
+|------|---------|
+| `mmdet3d/core/utils/visualize.py` | `np.bool` → `np.bool_` |
+| `mmdet3d/datasets/pipelines/loading.py` | `np.bool` → `bool` |
+| `mmdet3d/datasets/pipelines/transforms_3d.py` | `np.bool` → `bool` |
+
+### 训练 NaN 修复（`configs/default.yaml`）
+
+- **根本原因**：`fp16.loss_scale` 中只配置了 `growth_interval: 2000`，未设置 `init_scale`，PyTorch `GradScaler` 默认 `init_scale=65536` → mini 数据集早期 FP16 溢出 → `grad_norm: nan`。
+- **修复**：在 `configs/default.yaml` 的 `fp16.loss_scale` 下添加 `init_scale: 512`。
+
+```yaml
+# configs/default.yaml
+fp16:
+  loss_scale:
+    init_scale: 512        # ← 新增，防止早期 FP16 溢出
+    growth_interval: 2000
+```
+
+### quant_ptq_minmax.py 修复
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 1 | `dist.init()` 无条件调用，需要 `mpi4py`（未安装） | 仿照 `train.py`：仅在 `RANK`/`WORLD_SIZE` 环境变量存在时调用 |
+| 2 | `cfg.pretty_text` → `yapf.FormatCode()` 参数不兼容 | 改为 `f"{cfg}"` |
+| 3 | 校准时模型未包在 `MMDataParallel` 中，`DataContainer` 未解包 | 校准前 `model = MMDataParallel(model, device_ids=[0])` |
+| 4 | 保存块中 `dist.is_master()` 在非分布式模式下报错 | 移除条件，无条件保存 |
+| 5 | 校准数据集使用训练集（含 `GTDepth`），与 `return_loss=False` 推理模式冲突 | 改用验证集（`cfg.data.val`，`test_mode=True`） |
+
+### quant_train.py 修复
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 1 | `dist.init()` 无条件调用 | 同上，条件化 |
+| 2 | `cfg.pretty_text` 不兼容 | 改为 `f"{cfg}"` |
+| 3 | `torch.cuda.set_device(dist.local_rank())` 在非分布式下报错 | 条件化，单 GPU 时 `set_device(0)` |
+| 4 | `cfg.gpu_ids` 未设置导致单 GPU 模式异常 | 非分布式时补充 `cfg.gpu_ids = [0]` |
+| 5 | `train_qat_model(distributed=True)` 硬编码 | 改为传入 `distributed` 变量 |
+
+### depth_lss.py 修复
+
+- **问题**：`BaseDepthTransform.forward()` 调用 `self.get_cam_feats(img, depth, mats_dict)`（3 个位置参数），但 `DepthLSSTransform.get_cam_feats(self, x, d)` 只接受 2 个 → `TypeError: takes 3 positional arguments but 4 were given`。
+- **修复**：签名改为 `def get_cam_feats(self, x, d, mats_dict=None)`（`mats_dict` 为可选，`DepthLSSTransform` 不使用它）。
+
+### 验证结果
+
+| 脚本 | 状态 | 备注 |
+|------|------|------|
+| `test.py` | ✅ 通过 | NDS = 0.5803，与历史基线一致 |
+| `quant_ptq_minmax.py` | ✅ 通过 | 16 batch 校准全部成功，模型保存至 `runs/.../ptq_minmax_model.pth` |
+| `train.py` | ⚠️ 修复已应用，未重跑验证 | `init_scale: 512` 应解决 NaN 问题 |
+| `quant_train.py` | ⚠️ 未测试 | 脚本修复已完成 |
+| `quant_benchmark.py` | ⚠️ 未测试 | — |
+
+### PTQ 量化覆盖情况（已知限制）
+
+以下子模块因 `torch.fx` 符号追踪限制无法量化，已自动跳过：
+
+- `camera/backbone`（SwinTransformer：含控制流）
+- `camera/neck`（GeneralizedLSSFPN：含 `len()`）
+- `fuser`（ConvFuser：`Proxy + cat()` 冲突）
+- `decoder/neck`（SECONDFPN：含 `len()`）
+- `heads/object`（TransFusionHead：含 Proxy 迭代）
+
+**成功量化**：`decoder/backbone`（SECOND 稀疏卷积 backbone）。
+
 
 
 

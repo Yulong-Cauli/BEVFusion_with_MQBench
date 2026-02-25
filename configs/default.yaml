@@ -26,6 +26,7 @@ resume_from: null  # 从断点恢复训练的路径（null表示从零开始）
 cudnn_benchmark: false  # 是否使用cuDNN自动优化（false确保复现性）
 fp16:  # 混合精度训练配置
   loss_scale:   # 损失缩放，用于防止float16下梯度下溢
+    init_scale: 512  # 初始 loss scale（默认65536太大易溢出，512更保守）
     growth_interval: 2000  # 每2000步尝试增加loss_scale
 
 # ========== 训练周期配置 ==========

@@ -329,7 +329,13 @@ def main():
         --load_from pretrained/bevfusion-det.pth
     """
     # 初始化分布式环境
-    dist.init()
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        dist.init()
+        distributed = True
+    else:
+        distributed = False
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
     
     # 解析命令行参数
     parser = argparse.ArgumentParser(
@@ -359,7 +365,12 @@ def main():
     
     # 设置 CUDA
     torch.backends.cudnn.benchmark = cfg.cudnn_benchmark
-    torch.cuda.set_device(dist.local_rank())
+    if distributed:
+        torch.cuda.set_device(dist.local_rank())
+    else:
+        if not torch.cuda.is_available():
+            raise RuntimeError("No GPU found. Please run on a machine with CUDA.")
+        cfg.gpu_ids = [0]
     
     # 设置运行目录
     if args.run_dir is None:
@@ -383,7 +394,7 @@ def main():
     logger = get_root_logger(log_file=log_file)
     
     # 打印配置
-    logger.info(f"配置文件:\n{cfg.pretty_text}")
+    logger.info(f"配置文件:\n{cfg}")
     logger.info(f"MQBench QAT 训练启动")
     
     # 设置随机种子
@@ -422,7 +433,7 @@ def main():
         model,
         datasets,
         cfg,
-        distributed=True,
+        distributed=distributed,
         validate=True,
         timestamp=timestamp,
     )

@@ -41,6 +41,7 @@ import torch
 import torch.nn as nn
 from mmcv import Config
 from mmcv.runner import load_checkpoint
+from mmcv.parallel import MMDataParallel
 from torchpack.utils.config import configs
 
 from mmdet3d.datasets import build_dataloader, build_dataset
@@ -271,7 +272,7 @@ def build_fp32_model(cfg, checkpoint_path=None, device="cuda"):
         print(f"  加载浮点权重: {checkpoint_path}")
         load_checkpoint(model, checkpoint_path, map_location="cpu")
 
-    model = model.to(device)
+    model = MMDataParallel(model, device_ids=[0])
     model.eval()
     return model
 
@@ -317,7 +318,7 @@ def build_quant_model(cfg, quant_checkpoint_path, device="cuda"):
     # 切换到量化推理模式
     enable_quantization(model)
 
-    model = model.to(device)
+    model = MMDataParallel(model, device_ids=[0])
     model.eval()
     return model
 

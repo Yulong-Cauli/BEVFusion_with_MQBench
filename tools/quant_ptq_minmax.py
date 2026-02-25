@@ -50,6 +50,8 @@ from torchpack import distributed as dist
 from torchpack.environ import auto_set_run_dir, set_run_dir
 from torchpack.utils.config import configs
 
+from mmcv.parallel import MMDataParallel
+from mmdet3d.apis import single_gpu_test
 from mmdet3d.datasets import build_dataloader, build_dataset
 from mmdet3d.models import build_model
 from mmdet3d.utils import get_root_logger, convert_sync_batchnorm, recursive_eval
@@ -279,31 +281,23 @@ def build_ptq_model(cfg, logger):
 # 评估
 # ============================================================================
 
-def evaluate_quantized_model(model, data_loader, logger):
+def evaluate_quantized_model(model, data_loader, dataset, cfg, logger):
     """
-    对量化模型进行前向推理，验证量化后是否正常工作。
-
-    Args:
-        model: 量化后的模型
-        data_loader: 验证集数据加载器
-        logger: 日志记录器
+    对量化模型进行完整评估，输出 NDS / mAP 指标。
     """
-    logger.info("开始评估量化模型（验证集前向推理）...")
-    model.eval()
-    total = 0
+    logger.info("开始评估量化模型（验证集推理 + NDS/mAP 计算）...")
+    outputs = single_gpu_test(model, data_loader)
+    logger.info(f"量化模型推理完成，共处理 {len(outputs)} 个样本。")
 
-    with torch.no_grad():
-        for i, data in enumerate(data_loader):
-            try:
-                result = model(return_loss=False, rescale=True, **data)
-                total += len(result)
-            except Exception as e:
-                logger.warning(f"  评估 batch {i} 出错: {e}")
-                break
-            if (i + 1) % 50 == 0:
-                logger.info(f"  评估进度: {i + 1} batches ({total} 样本)")
+    eval_kwargs = cfg.get("evaluation", {}).copy()
+    # 去掉训练专用 key
+    for key in ("interval", "tmpdir", "start", "gpu_collect", "save_best", "rule", "dynamic_intervals"):
+        eval_kwargs.pop(key, None)
+    eval_kwargs.update(dict(metric="bbox"))
 
-    logger.info(f"量化模型评估完成，共处理 {total} 个样本。")
+    logger.info("计算量化模型 NDS / mAP ...")
+    metrics = dataset.evaluate(outputs, **eval_kwargs)
+    logger.info(f"量化模型评估结果:\n{metrics}")
 
 
 # ============================================================================
@@ -321,7 +315,13 @@ def main():
       5. (可选) 评估量化模型精度
       6. 保存量化模型检查点
     """
-    dist.init()
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        dist.init()
+        distributed = True
+    else:
+        distributed = False
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
 
     parser = argparse.ArgumentParser(
         description="BEVFusion PTQ (MinMax) with MQBench — Selective Quantization"
@@ -352,7 +352,6 @@ def main():
     cfg = Config(recursive_eval(configs), filename=args.config)
 
     torch.backends.cudnn.benchmark = cfg.cudnn_benchmark
-    torch.cuda.set_device(dist.local_rank())
 
     if args.run_dir is None:
         args.run_dir = auto_set_run_dir()
@@ -372,7 +371,7 @@ def main():
     logger.info("=" * 60)
     logger.info("BEVFusion PTQ — MinMax 选择性量化")
     logger.info("=" * 60)
-    logger.info(f"配置文件:\n{cfg.pretty_text}")
+    logger.info(f"配置文件:\n{cfg}")
 
     if cfg.seed is not None:
         logger.info(f"随机种子: {cfg.seed}")
@@ -386,8 +385,11 @@ def main():
     # ------------------------------------------------------------------
     # Step 1: 构建校准数据集
     # ------------------------------------------------------------------
-    logger.info("构建校准数据集（使用训练集）...")
-    calib_dataset = build_dataset(cfg.data.train)
+    # 使用验证集做校准（test_mode=True，与推理流程一致，不含 GTDepth 等训练专属字段）
+    logger.info("构建校准数据集（使用验证集，test_mode=True）...")
+    calib_cfg = cfg.data.val.copy()
+    calib_cfg.test_mode = True
+    calib_dataset = build_dataset(calib_cfg)
     calib_loader = build_dataloader(
         calib_dataset,
         samples_per_gpu=1,
@@ -412,8 +414,8 @@ def main():
     # ------------------------------------------------------------------
     logger.info("构建 PTQ 模型（选择性 MinMax 量化）...")
     model = build_ptq_model(cfg, logger)
-    model.cuda()
-    logger.info("模型已移动到 GPU。")
+    model = MMDataParallel(model.cuda(), device_ids=[0])
+    logger.info("模型已移动到 GPU（MMDataParallel）。")
 
     # ------------------------------------------------------------------
     # Step 3: MinMax 校准
@@ -425,42 +427,38 @@ def main():
     # Step 4: 评估量化模型（可选）
     # ------------------------------------------------------------------
     if not args.no_eval:
-        evaluate_quantized_model(model, val_loader, logger)
+        evaluate_quantized_model(model, val_loader, val_dataset, cfg, logger)
 
     # ------------------------------------------------------------------
     # Step 5: 保存量化模型
     # ------------------------------------------------------------------
-    if dist.is_master():
-        save_path = os.path.join(cfg.run_dir, "ptq_minmax_model.pth")
-        torch.save(
-            {
-                "state_dict": (
-                    model.module.state_dict()
-                    if hasattr(model, "module")
-                    else model.state_dict()
-                ),
-                "meta": {
-                    "ptq_method": "MinMax",
-                    "backend": "TensorRT",
-                    "quantized_modules": [k for k, _ in _QUANTIZABLE_SUBMODULE_KEYS]
-                    + ["heads/*"],
-                    "skipped_modules": [
-                        "camera/vtransform",
-                        "lidar/voxelize",
-                        "lidar/backbone (SparseEncoder)",
-                    ],
-                },
+    save_path = os.path.join(cfg.run_dir, "ptq_minmax_model.pth")
+    inner_model = model.module if hasattr(model, "module") else model
+    torch.save(
+        {
+            "state_dict": inner_model.state_dict(),
+            "meta": {
+                "ptq_method": "MinMax",
+                "backend": "TensorRT",
+                "quantized_modules": [k for k, _ in _QUANTIZABLE_SUBMODULE_KEYS]
+                + ["heads/*"],
+                "skipped_modules": [
+                    "camera/vtransform",
+                    "lidar/voxelize",
+                    "lidar/backbone (SparseEncoder)",
+                ],
             },
-            save_path,
-        )
-        logger.info(f"PTQ 量化模型已保存至: {save_path}")
+        },
+        save_path,
+    )
+    logger.info(f"PTQ 量化模型已保存至: {save_path}")
 
     logger.info("PTQ (MinMax) 流程完成！")
     logger.info(
         "后续步骤提示：\n"
         "  1. 使用 tools/quant_benchmark.py 查看模型大小与推理速度\n"
-        "  2. 使用 tools/test.py 对量化模型进行完整评估\n"
-        "  3. 如精度下降过多，可切换到 tools/quant_train.py 进行 QAT 微调"
+        "  2. 如精度下降过多，可切换到 tools/quant_train.py 进行 QAT 微调\n"
+        "  注意：PTQ checkpoint 含 FakeQuant 结构，不能直接用 tools/test.py 评估"
     )
 
 
