@@ -31,6 +31,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 | `tools/test.py` | ✅ | NDS = 0.5800 |
 | `tools/quant_ptq_minmax.py` | ✅ | NDS = 0.5774（PTQ 4/6 模块量化，精度损失 0.27%） |
 | `tools/quant_benchmark.py` | ✅ | 可运行 |
+| `tools/trt_export_fuser.py` | ✅ | ConvFuser TRT PoC：INT8 6.81x 加速 |
 | `tools/train.py` | ⚠️ | NaN 修复已应用但未验证 |
 | `tools/quant_train.py` | ⚠️ | 脚本已修复但未测试 |
 
@@ -74,10 +75,15 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 ### 下一步：TensorRT INT8 导出（见 PTQ_BENCHMARK_NOTES.md 第五节问题 2）
 
-当前 PTQ 结果均为 FakeQuant 仿真，真实加速需导出 TRT 引擎。推荐分段导出方案：
+✅ **ConvFuser PoC 已完成**：FP32 ONNX → TRT INT8 引擎，6.81x 加速、6.48x 压缩。
 
-1. **安装 TensorRT**：CUDA 11.3 → TRT 8.5.x（pip 或 NVIDIA 官网 zip）
-2. **逐模块 ONNX 导出**：camera/neck、fuser、decoder/backbone、decoder/neck（均为纯标准算子，ONNX 友好）
-3. **构建 INT8 引擎**：`trtexec` 或 Python API
-4. **Hybrid Runner**：TRT 引擎 + PyTorch 混合推理
-5. 不可导出的部分（SpConv、bev_pool、SwinTransformer、TransFusionHead）保持 PyTorch 执行
+**已验证的导出方案**：
+- MQBench `convert_deploy` / `torch.onnx.export` 均无法导出 FakeQuant 模型（PyTorch 1.10 限制）
+- 可行方案：导出 FP32 ONNX → TRT `IInt8EntropyCalibrator2` 原生 INT8 校准
+- 参考脚本：`tools/trt_export_fuser.py`
+
+**待推广到其余模块**：
+1. decoder/backbone（SECOND）→ 确定输入 shape，编写 wrapper
+2. decoder/neck（SECONDFPN）→ 含 ConvTranspose2d，编写 wrapper
+3. camera/neck（GeneralizedLSSFPN）→ 多尺度输入，编写 wrapper
+4. 编写 Hybrid Runner 整合 TRT 引擎 + PyTorch 推理

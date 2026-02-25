@@ -107,3 +107,39 @@
 | fuser（ConvFuser） | ✅ 已量化（本次新增） |
 | camera/backbone（SwinTransformer） | ❌ fx 追踪失败（动态控制流） |
 | heads/object（TransFusionHead） | ❌ fx 追踪失败（Proxy 迭代） |
+
+---
+
+## 2026-02-25 21:00 · ConvFuser TensorRT 导出 Proof-of-Concept
+
+**环境**：RTX 4060 Laptop（Ada，Compute 8.9），TensorRT 10.15.1.29，PyTorch 1.10.2+cu113
+
+**方法**：将 ConvFuser（Conv2d 336→256 + BN + ReLU）的 FP32 权重导出为 ONNX，通过 TensorRT 分别构建 FP32 / FP16 / INT8 引擎。INT8 使用 TRT 自带的 `IInt8EntropyCalibrator2`（50 batch 随机数据校准）。
+
+**导出脚本**：`tools/trt_export_fuser.py`
+
+### 性能对比
+
+| 方法 | 延迟 | 加速比 | 引擎大小 | 压缩比 |
+|------|------|--------|---------|--------|
+| PyTorch FP32 | 5.083 ms | 1.00x | — | — |
+| TRT FP32 | 4.017 ms | **1.27x** | 5385 KB | 1.00x |
+| TRT FP16 | 1.437 ms | **3.54x** | 1543 KB | 3.49x |
+| TRT INT8 | 0.746 ms | **6.81x** | 832 KB | 6.48x |
+
+### 关键观察
+
+- **INT8 加速非常显著**：比 PyTorch FP32 快 6.81 倍，比 TRT FP32 也快 5.39 倍
+- **模型压缩**：INT8 引擎仅 832 KB（FP32 引擎 5.4 MB），压缩 6.48 倍
+- **FP16 也很有价值**：3.54 倍加速，适合对精度敏感的场景
+- 此为单个子模块的 PoC，实际端到端加速取决于所有可导出模块的综合优化
+
+### 导出文件
+
+| 文件 | 大小 |
+|------|------|
+| `runs/trt_export/fuser_fp32.onnx` | 3025 KB |
+| `runs/trt_export/fuser_fp32.engine` | 5385 KB |
+| `runs/trt_export/fuser_fp16.engine` | 1543 KB |
+| `runs/trt_export/fuser_int8.engine` | 832 KB |
+| `runs/trt_export/calibration.cache` | — |

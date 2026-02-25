@@ -152,7 +152,32 @@ TransFusionHead 有 `for layer in self.decoder_layers:` 等动态迭代。可以
 
 **2. TensorRT INT8 导出（将 FakeQuant 转为真实 INT8 部署）**
 
-当前 benchmark 结果均为 FakeQuant 仿真（权重仍 FP32，GPU 上额外执行 quantize/dequantize），速度反而略慢。真实的 INT8 加速（2–4×）和体积压缩（4×）需要导出为 TensorRT 引擎。
+~~当前 benchmark 结果均为 FakeQuant 仿真（权重仍 FP32，GPU 上额外执行 quantize/dequantize），速度反而略慢。真实的 INT8 加速（2–4×）和体积压缩（4×）需要导出为 TensorRT 引擎。~~
+
+✅ **ConvFuser PoC 已完成**：通过 FP32 ONNX → TRT 原生 INT8 校准方案验证了 6.81x 加速、6.48x 压缩。
+
+**已验证方案（绕过 MQBench 导出限制）：**
+
+MQBench `convert_deploy` 和 `torch.onnx.export` 都无法导出 FakeQuant 模型（PyTorch 1.10 缺少自定义 op 的 ONNX symbolic）。
+实际可行方案：导出 FP32 ONNX → TRT `IInt8EntropyCalibrator2` 做 INT8 校准 → 构建引擎。
+
+**ConvFuser PoC 结果（`tools/trt_export_fuser.py`）：**
+
+| 方法 | 延迟 | 加速比 | 引擎大小 | 压缩比 |
+|------|------|--------|---------|--------|
+| PyTorch FP32 | 5.083 ms | 1.00x | — | — |
+| TRT FP32 | 4.017 ms | 1.27x | 5385 KB | 1.00x |
+| TRT FP16 | 1.437 ms | 3.54x | 1543 KB | 3.49x |
+| TRT INT8 | 0.746 ms | **6.81x** | 832 KB | **6.48x** |
+
+**下一步：推广到其余 3 个已量化模块**
+
+| 模块 | ONNX 导出难度 | 备注 |
+|------|-------------|------|
+| fuser（ConvFuser） | ✅ 已完成 | 需 wrapper 将 list input → 两个独立参数 |
+| decoder/backbone（SECOND） | 中等 | 纯 Conv2d 堆叠，需确定输入 shape |
+| decoder/neck（SECONDFPN） | 中等 | 含 ConvTranspose2d，需 wrapper |
+| camera/neck（GeneralizedLSSFPN） | 中等 | 含多尺度输入，需 wrapper |
 
 **BEVFusion TRT 导出的核心难点：**
 
@@ -212,6 +237,6 @@ NVIDIA 有 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_AI_Solution/t
 
 ### 优先级建议
 
-- 目标是**看到真实 INT8 部署效果** → 安装 TensorRT，按分段导出方案逐模块导出（详见问题 2）
+- 目标是**看到真实 INT8 部署效果** → ✅ ConvFuser PoC 已完成（6.81x 加速）。下一步推广到 decoder/backbone、decoder/neck、camera/neck，编写 Hybrid Runner 整合端到端推理
 - 目标是**进一步扩大量化覆盖** → 尝试 `camera/backbone`（SwinTransformer）和 `heads/object`（TransFusionHead），均为困难级别
 - 目标是**跑通完整训练流程** → 验证 `train.py`（问题 3）+ 跑一次 QAT（问题 4）

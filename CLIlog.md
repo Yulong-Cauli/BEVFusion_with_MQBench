@@ -280,6 +280,39 @@ fp16:
 | 量化成功模块数 | 3/6 | **4/6** |
 | PTQ NDS | 0.5799 | 0.5774（精度损失 0.27%，可接受） |
 
+---
+
+## 2026-02-25 · ConvFuser TensorRT 导出 PoC
+
+**目标**：验证 TRT INT8 导出和真实加速效果，以 ConvFuser 作为 Proof-of-Concept。
+
+### 方案
+
+MQBench 的 `convert_deploy` API 不兼容列表输入（ConvFuser 的 `forward` 接受 `List[Tensor]`），`torch.onnx.export` 也无法导出 MQBench 自定义 FakeQuant 算子（`LearnablePerTensorAffine` 无 ONNX symbolic）。
+
+**绕过方案**：跳过 MQBench 导出，直接导出 FP32 ONNX → 让 TRT 使用自带的 `IInt8EntropyCalibrator2` 做 INT8 校准 → 构建 INT8 引擎。
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `tools/trt_export_fuser.py` | 完整的 ONNX 导出 + TRT FP32/FP16/INT8 引擎构建 + 延迟基准测试脚本 |
+
+### 结果
+
+| 方法 | 延迟 | 加速比 | 引擎大小 | 压缩比 |
+|------|------|--------|---------|--------|
+| PyTorch FP32 | 5.083 ms | 1.00x | — | — |
+| TRT FP32 | 4.017 ms | 1.27x | 5385 KB | 1.00x |
+| TRT FP16 | 1.437 ms | 3.54x | 1543 KB | 3.49x |
+| TRT INT8 | 0.746 ms | **6.81x** | 832 KB | **6.48x** |
+
+### 关键经验
+
+- MQBench 的 `convert_deploy` 和 `torch.onnx.export` 都无法直接导出 FakeQuant 模型到 ONNX（PyTorch 1.10 缺少 MQBench 自定义 op 的 ONNX symbolic 注册）
+- 务实做法：FP32 ONNX + TRT 原生 INT8 校准（Entropy Calibrator）可获得 6.8x 加速
+- 下一步可将此方案推广到 decoder/backbone、decoder/neck、camera/neck
+
 
 
 
