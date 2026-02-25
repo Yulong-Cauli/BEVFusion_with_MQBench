@@ -46,6 +46,7 @@ MQBench 的量化是"仿真量化"（Fake Quantization / QAT/PTQ 模拟），其
 $env:PYTHONUTF8="1"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
+conda activate bevfusion
 ```
 
 ```powershell
@@ -107,7 +108,7 @@ FP32 基准：**NDS = 0.5800，mAP = 0.5742**。PTQ 结果在 `results_ptq.log` 
 
 ---
 
-### 方案 A：手动修复模型代码使其对 fx 可追踪（中等难度）
+### 方案 ：手动修复模型代码使其对 fx 可追踪（中等难度）
 
 `torch.fx` 符号追踪要求所有控制流基于 Python 常量，不能依赖 Tensor 的运行时值。针对各失败原因：
 
@@ -136,46 +137,6 @@ TransFusionHead 有 `for layer in self.decoder_layers:` 等动态迭代。可以
 
 ---
 
-### 方案 B：改用逐层手动插入 Observer（低侵入，较繁琐）
-
-不依赖 fx 的自动追踪，直接对目标模块的每个 `nn.Conv2d` / `nn.Linear` 手动替换为 `QuantizedConv2d` / `QuantizedLinear`（MQBench 提供了这些类），或用 `torch.quantization.prepare` 的手动 qconfig 注入方式。
-
-优点：不受 fx 限制，可覆盖任意模块。  
-缺点：需要手动枚举每个待量化子层，代码量较大。
-
----
-
-### 方案 C：换用 PyTorch 原生 PTQ（`torch.quantization`）
-
-PyTorch 官方的 `torch.quantization.prepare` → `calibrate` → `torch.quantization.convert` 流程不依赖 fx，基于 Module Hook，兼容性更好。
-
-步骤：
-1. 对模型的 `nn.Conv2d` / `nn.Linear` 层设置 `qconfig`
-2. `torch.quantization.prepare(model, inplace=True)` 插入 Observer
-3. 用验证集跑前向收集统计量
-4. `torch.quantization.convert(model, inplace=True)` 将权重转为 INT8
-
-缺点：与 MQBench 的 QAT 流程分离，如果后续要做 QAT 微调需要额外适配。
-
----
-
-### 方案 D：直接导出 TensorRT（跳过 FakeQuant，直接得到部署结果）
-
-跳过 MQBench，直接将 FP32 模型通过 ONNX 导出到 TensorRT，使用 TensorRT 自带的 PTQ（`IInt8EntropyCalibrator2`）校准。
-
-优点：直接得到真实 INT8 推理速度和大小，不受 fx 限制，TensorRT 对逐层自动量化支持更好。  
-缺点：BEVFusion 含稀疏卷积（SpConv）和自定义 CUDA 算子，ONNX 导出较困难，需要额外适配。
-
----
-
-### 方案 E：仅量化 decoder 部分，其余保持 FP32（当前方案的最优化）
-
-当前方案已经量化了 `decoder/backbone`（SECOND）、`decoder/neck`（SECONDFPN）、`camera/neck`（GeneralizedLSSFPN）和 `fuser`（ConvFuser）。剩余可尝试的扩展：
-
-这两个修复工作量最小，收益相对明显（fuser 和 decoder/neck 合计参数量不小），是性价比最高的扩展路径。
-
----
-
 ## 五、当前开放问题汇总
 
 ### 🔴 功能性问题（影响结果质量）
@@ -189,11 +150,55 @@ PyTorch 官方的 `torch.quantization.prepare` → `calibrate` → `torch.quanti
 | 困难 | `camera/backbone`（SwinTransformer） | 动态控制流 | 传 `concrete_args` 固定输入尺寸 |
 | 困难 | `heads/object`（TransFusionHead） | Proxy 被迭代 | 展开 ModuleList 或包装函数 |
 
-**2. TensorRT 导出未做**
+**2. TensorRT INT8 导出（将 FakeQuant 转为真实 INT8 部署）**
 
-当前能看到的大小/速度都是 FakeQuant 仿真值，无实际意义。需要在 Windows GPU 机器上安装 TensorRT 才能导出，且覆盖率扩大后导出价值更高。
+当前 benchmark 结果均为 FakeQuant 仿真（权重仍 FP32，GPU 上额外执行 quantize/dequantize），速度反而略慢。真实的 INT8 加速（2–4×）和体积压缩（4×）需要导出为 TensorRT 引擎。
 
-> 注意：TensorRT 引擎构建必须在有 NVIDIA GPU 的机器上进行，且引擎是硬件绑定的（在哪块 GPU 上构建就只能在那块 GPU 上运行）。无 GPU 的 Linux 机器无法参与此流程。
+**BEVFusion TRT 导出的核心难点：**
+
+| 组件 | ONNX 兼容性 | 说明 |
+|------|------------|------|
+| camera/neck, fuser, decoder/backbone, decoder/neck | ✅ 纯标准算子 | Conv2d / ConvTranspose2d / BN / ReLU，可直接导出 |
+| camera/backbone（SwinTransformer） | 🟡 需验证 | `roll` / `window_partition` 等操作 ONNX 支持参差不齐 |
+| camera/vtransform（bev_pool） | 🔴 不支持 | `QuickCumsumCuda` 自定义 CUDA autograd Function，无 ONNX 等价 |
+| lidar/backbone（SpConv） | 🔴 不支持 | 稀疏卷积，无标准 ONNX 算子 |
+| heads/object（TransFusionHead） | 🟡 需 opset ≥ 11 | 含 `topk` / `scatter` / `nonzero` 等动态 shape 操作 |
+
+**推荐方案：分段导出（Hybrid 推理）**
+
+只将已量化且 ONNX 友好的 4 个子模块导出为 TRT INT8 引擎，其余保持 PyTorch 执行：
+
+```
+TRT INT8 引擎（已量化，标准算子）：
+├── camera/neck (GeneralizedLSSFPN)  → ONNX → TRT INT8
+├── fuser (ConvFuser)                → ONNX → TRT INT8
+├── decoder/backbone (SECOND)        → ONNX → TRT INT8
+└── decoder/neck (SECONDFPN)         → ONNX → TRT INT8
+
+PyTorch 执行（未量化或 ONNX 不兼容）：
+├── camera/backbone (SwinTransformer)
+├── camera/vtransform (bev_pool CUDA 算子)
+├── lidar/* (SpConv 稀疏卷积)
+└── heads/object (TransFusionHead)
+```
+
+**实施步骤：**
+
+1. **安装 TensorRT**：CUDA 11.3 对应 TRT 8.5.x 或 8.6.x（Windows pip 安装）
+   ```powershell
+   pip install tensorrt==8.5.3.1
+   # 或从 NVIDIA 官网下载 Windows zip 包安装
+   ```
+2. **逐模块 ONNX 导出**：对每个已量化子模块调用 `torch.onnx.export`（或 MQBench `convert_deploy`）
+3. **构建 INT8 引擎**：用 `trtexec` 或 Python API，传入量化参数（scale/zero_point）
+4. **Hybrid Runner**：编写推理脚本，TRT 引擎处理已量化子模块，PyTorch 处理其余部分
+5. **验证一致性**：对比 TRT INT8 输出 vs FakeQuant 输出，确认数值误差在可接受范围
+
+**备选参考：NVIDIA 官方 BEVFusion TRT 部署**
+
+NVIDIA 有 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_AI_Solution/tree/master/CUDA-BEVFusion) 项目，提供了完整的 TensorRT 适配（含 SpConv plugin、bev_pool plugin），但它是独立的 C++ 工程，与 MQBench 量化流程不直接兼容，仅供架构参考。
+
+> 注意：TensorRT 引擎是硬件绑定的（在哪块 GPU 上构建就只能在那块 GPU 上运行）。引擎构建必须在目标部署 GPU 上进行。
 
 ### 🟡 验证缺失（脚本改了但没跑过）
 
@@ -207,5 +212,6 @@ PyTorch 官方的 `torch.quantization.prepare` → `calibrate` → `torch.quanti
 
 ### 优先级建议
 
-- 目标是**看到真实量化效果** → 先做问题 1（扩大覆盖），再做问题 2（TRT 导出）。当前只量化 SECOND backbone，TRT 导出后加速比也有限，意义不大。
-- 目标是**跑通完整流程** → 先做问题 3（验证训练）+ 问题 4（跑一次 QAT）。
+- 目标是**看到真实 INT8 部署效果** → 安装 TensorRT，按分段导出方案逐模块导出（详见问题 2）
+- 目标是**进一步扩大量化覆盖** → 尝试 `camera/backbone`（SwinTransformer）和 `heads/object`（TransFusionHead），均为困难级别
+- 目标是**跑通完整训练流程** → 验证 `train.py`（问题 3）+ 跑一次 QAT（问题 4）

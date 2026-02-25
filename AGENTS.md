@@ -71,3 +71,13 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 ### 次要：验证训练和 QAT
 - 跑 `tools/train.py` 约 100 步确认 `grad_norm` 不再出现 NaN（已在 `configs/default.yaml` 加 `init_scale: 512`）
 - 跑 `tools/quant_train.py` 验证 QAT 能启动不崩溃
+
+### 下一步：TensorRT INT8 导出（见 PTQ_BENCHMARK_NOTES.md 第五节问题 2）
+
+当前 PTQ 结果均为 FakeQuant 仿真，真实加速需导出 TRT 引擎。推荐分段导出方案：
+
+1. **安装 TensorRT**：CUDA 11.3 → TRT 8.5.x（pip 或 NVIDIA 官网 zip）
+2. **逐模块 ONNX 导出**：camera/neck、fuser、decoder/backbone、decoder/neck（均为纯标准算子，ONNX 友好）
+3. **构建 INT8 引擎**：`trtexec` 或 Python API
+4. **Hybrid Runner**：TRT 引擎 + PyTorch 混合推理
+5. 不可导出的部分（SpConv、bev_pool、SwinTransformer、TransFusionHead）保持 PyTorch 执行
