@@ -196,7 +196,7 @@ python tools/trt_eval_hybrid_all.py `
     --precision fp32 2>&1 | Tee-Object -FilePath "results_trt_all_fp32.log"
 ```
 
-**预期输出**：NDS ≈ 0.5800, mAP ≈ 0.5744, 全引擎 42.6 MB（3.7x 压缩）
+**预期输出**：NDS ≈ 0.5800, mAP ≈ 0.5744, 4 模块引擎 42.6 MB
 
 ### FP16 精度
 
@@ -208,7 +208,7 @@ python tools/trt_eval_hybrid_all.py `
     --precision fp16 2>&1 | Tee-Object -FilePath "results_trt_all_fp16.log"
 ```
 
-**预期输出**：NDS ≈ 0.5795, mAP ≈ 0.5743, 全引擎 13.5 MB（11.5x 压缩）
+**预期输出**：NDS ≈ 0.5795, mAP ≈ 0.5743, 4 模块引擎 13.5 MB
 
 ### INT8 精度（需校准）
 
@@ -221,7 +221,7 @@ python tools/trt_eval_hybrid_all.py `
     --calib-samples 50 2>&1 | Tee-Object -FilePath "results_trt_all_int8.log"
 ```
 
-**预期输出**：NDS ≈ 0.5723, mAP ≈ 0.5652, 全引擎 7.2 MB（21.6x 压缩）
+**预期输出**：NDS ≈ 0.5723, mAP ≈ 0.5652, 4 模块引擎 7.2 MB
 
 ---
 

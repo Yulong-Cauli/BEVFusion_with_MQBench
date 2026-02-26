@@ -84,12 +84,52 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 **全模块导出结果**：
 
-| 精度 | NDS | 引擎总大小 | 压缩比 |
-|------|-----|-----------|--------|
-| FP32 | 0.5800 | 42.6 MB | 3.7x |
-| FP16 | 0.5795 | 13.5 MB | 11.5x |
-| INT8 | 0.5723 | 7.2 MB | 21.6x |
+| 精度 | NDS | 4 模块引擎大小 | 模块压缩比（vs 26.5 MB FP32 权重） |
+|------|-----|-------------|-------------------------------|
+| FP32 | 0.5800 | 42.6 MB | — |
+| FP16 | 0.5795 | 13.5 MB | 1.96x |
+| INT8 | 0.5723 | 7.2 MB | 3.68x |
 
-**未量化模块**（仍以 PyTorch FP32 运行）：
-- camera/backbone（SwinTransformer）— 动态控制流
-- heads/object（TransFusionHead）— Proxy 迭代问题
+**未量化模块**（仍以 PyTorch FP32 运行，合计 129.4 MB / 83% 参数）：
+- camera/backbone（SwinTransformer）— 动态控制流，67.5% 参数（105.2 MB）
+- heads/object（TransFusionHead）— Proxy 迭代问题，2.5% 参数
+- lidar/backbone（SparseEncoder）— 稀疏卷积，6.6% 参数
+- camera/vtransform（bev_pool）— 自定义 CUDA 算子，6.4% 参数
+
+## 后续优化方向
+
+### 方向 1：替换 SwinTransformer 为量化友好的主干网络（推荐，影响最大）
+
+SwinTransformer 占全模型 67.5% 参数但无法量化。替换为量化友好的 CNN 主干可大幅提高量化覆盖率：
+
+| 候选主干 | 参数量 | fx 兼容性 | 预期 NDS 影响 | 备注 |
+|---------|--------|----------|-------------|------|
+| ResNet-50 + FPN | ~25M | ✅ 完全兼容 | 可能下降 2-5% | 纯 Conv2d，量化最友好 |
+| ResNet-101 + FPN | ~44M | ✅ 完全兼容 | 接近 SwinT | 更大但更准 |
+| EfficientNet-B4 | ~19M | ✅ 基本兼容 | 待验证 | 参数更少，可能需调参 |
+| ConvNeXt-Tiny | ~28M | ✅ 基本兼容 | 接近 SwinT | 纯卷积的 Transformer 替代 |
+
+**实施方式**：BEVFusion 的 camera backbone 是配置化的（`configs/` 中指定），理论上只需修改 config 文件并重新训练。但需要从头训练（或找到对应的预训练权重），不能直接复用现有 checkpoint。
+
+### 方向 2：SwinTransformer 量化的替代方案
+
+不更换主干，而是绕过 torch.fx 的限制：
+
+1. **手动插入 QuantStub/DeQuantStub**：不依赖 fx 自动追踪，手工在 SwinTransformer 的 Conv/Linear 层前后插入量化节点
+2. **使用 `concrete_args` 固定输入尺寸**：让 fx 常量折叠分支条件，可能解决部分动态控制流
+3. **ONNX 直接导出 + TRT 原生量化**：如果 SwinTransformer 能导出为 ONNX（需验证 `roll`/`window_partition` 的 ONNX 兼容性），则可跳过 MQBench，直接用 TRT 做 INT8 校准
+
+### 方向 3：更先进的校准策略
+
+当前使用最朴素的 MinMax 校准。可尝试：
+- **Histogram / Percentile 校准**：裁剪极端值，可能改善 INT8 精度
+- **AdaRound**（MQBench 支持）：学习最优的取整策略
+- **Per-channel 量化**：TRT 支持 per-channel INT8，可能改善精度
+
+### 方向 4：推理速度测量与优化
+
+当前缺少 Hybrid TRT 的推理时间数据。可在 `trt_eval_hybrid_all.py` 中添加计时代码，测量各精度方案的端到端延迟。
+
+### 方向 5：TransFusionHead 量化
+
+检测头的 Attention + FFN 层可以量化。障碍是 `ModuleList` 动态迭代，可通过静态展开（unroll）或手动量化解决。参数量小（1.04M），优先级低于 SwinTransformer。

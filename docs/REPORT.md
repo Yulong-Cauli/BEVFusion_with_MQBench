@@ -36,7 +36,10 @@ BEVFusion 是一种多模态 3D 目标检测模型，融合摄像头和激光雷
 |------|----------|------------------------|-------------------------|-------------------------|
 | NDS | 0.5801 | **0.5810 (+0.0009)** | **0.5723 (−0.0077)** | **0.5795 (−0.0005)** |
 | mAP | 0.5742 | **0.5759 (+0.0017)** | **0.5652 (−0.0092)** | **0.5743 (−0.0001)** |
-| 引擎总大小 | 156.1 MB (.pth) | — | **7.2 MB (21.6x↓)** | **13.5 MB (11.5x↓)** |
+| 4 模块 TRT 引擎大小 | — | — | **7.2 MB** | **13.5 MB** |
+| 4 模块压缩比 | — | — | **3.68x**（vs 26.5 MB FP32 权重） | **1.96x** |
+
+> ⚠️ **关于压缩比的说明**：4 个 TRT 模块的 FP32 权重合计 26.51 MB，仅占全模型 155.9 MB 的 17%。INT8 引擎 7.2 MB 相对于这 4 个模块的原始权重压缩了 3.68 倍。未量化的模块（SwinTransformer 等，占 83%）仍需以 FP32 权重形式加载。
 
 ---
 
@@ -203,7 +206,29 @@ BEVFusion 的推理管线可以分为以下几个阶段：
 | `decoder/neck` | SECONDFPN | ConvTranspose2d + BN + ReLU | 🟢 友好 |
 | `heads/object` | TransFusionHead | Attention + TopK + 动态 shape | 🔴 困难 |
 
-**关键观察**：量化友好的模块集中在 BEV 空间的中后段管线（neck → fuser → decoder），而计算最密集的 SwinTransformer 和稀疏卷积恰恰是最难量化的部分。
+### 各子模块的参数分布
+
+下表展示了各子模块在 FP32 预训练权重中的实际大小占比（基于 `pretrained/bevfusion-det.pth` 统计）：
+
+| 子模块 | 参数量 | FP32 权重大小 | 占比 | TRT 导出 |
+|--------|--------|-------------|------|---------|
+| `camera/backbone` (SwinTransformer) | 27.55M | **105.20 MB** | **67.5%** | ❌ |
+| `lidar/backbone` (SparseEncoder) | 2.70M | 10.29 MB | 6.6% | ❌ |
+| `camera/vtransform` (LSSTransform) | 2.61M | 9.95 MB | 6.4% | ❌ |
+| `decoder/backbone` (SECOND) | 4.29M | **16.35 MB** | **10.5%** | ✅ |
+| `camera/neck` (GeneralizedLSSFPN) | 1.59M | 6.08 MB | 3.9% | ✅ |
+| `heads/object` (TransFusionHead) | 1.04M | 3.95 MB | 2.5% | ❌ |
+| `fuser` (ConvFuser) | 0.78M | 2.95 MB | 1.9% | ✅ |
+| `decoder/neck` (SECONDFPN) | 0.30M | 1.13 MB | 0.7% | ✅ |
+| **总计** | **40.84M** | **155.91 MB** | **100%** | |
+| **4 个 TRT 模块合计** | **6.95M** | **26.51 MB** | **17.0%** | ✅ |
+| **未量化模块合计** | **33.89M** | **129.39 MB** | **83.0%** | ❌ |
+
+**关键观察**：
+
+1. **SwinTransformer 独占 67.5%**：摄像头主干网络是绝对的参数瓶颈，而它恰恰是最难量化的模块
+2. 量化友好的 4 个模块仅占总参数的 17.0%（26.51 MB），即使全部压缩为 INT8，对总模型大小的影响也有限
+3. 这意味着：**要显著压缩 BEVFusion，必须解决 SwinTransformer 的量化问题**，或者更换为量化友好的主干网络（如 ResNet）
 
 ---
 
@@ -250,7 +275,29 @@ PyTorch 执行区域：                    TRT 引擎区域（4 个模块）：
 └─────────────────────┘              └────────────────────────────┘
 ```
 
-每个 TRT 模块作为独立的 `nn.Module` 子类，可以直接替换原始 PyTorch 模块。推理时，输入张量已在 GPU 上（CUDA 显存），TRT 引擎直接读取，无需 CPU-GPU 拷贝。
+#### Hybrid 推理是怎么运行的？
+
+**TRT 引擎本质上是预编译好的 GPU 程序**。可以类比为：你用 C++ 写了几个高性能函数，编译成 `.dll`，然后在 Python 中通过 ctypes 调用。TRT 引擎做的事情类似，但更聪明——它直接操作 GPU 显存中的数据。
+
+整个推理流程中，数据**全程留在 GPU 显存**，不需要 CPU↔GPU 的数据拷贝：
+
+```
+步骤 1: PyTorch 模块（SwinTransformer 等）在 GPU 上计算 → 输出 tensor 在 GPU 显存中
+         ↓ （GPU 显存地址传递，无拷贝）
+步骤 2: TRT 引擎直接从 GPU 显存读取输入 → 在 GPU 上执行推理 → 结果写入 GPU 显存
+         ↓ （GPU 显存地址传递，无拷贝）
+步骤 3: PyTorch 模块（TransFusionHead）从 GPU 显存读取继续后续计算
+```
+
+在我们的实现中，每个 TRT 引擎被包装为一个 `nn.Module` 子类（如 `CameraNeckTRTWrapper`），可以像普通 PyTorch 模块一样调用 `module(input_tensor)`。模型的 `forward()` 方法不需要任何修改——只需用 TRT Wrapper 替换原始 PyTorch 子模块即可。
+
+#### 未量化的部分怎么运行？
+
+**依然靠 PyTorch 运行**。SwinTransformer、SpConv 稀疏卷积、bev_pool CUDA 算子、TransFusionHead 等模块仍然以 PyTorch FP32 模式在 GPU 上执行。这意味着：
+
+- **部署环境需要**：Python + PyTorch + TensorRT 运行时
+- **如果目标设备没有 Python**：需要将所有未量化模块也转成 C++，这是一个完全独立的工程（参考 NVIDIA 官方 CUDA-BEVFusion 项目，见第 10 节）
+- **当前方案的定位**：研究性验证（验证量化精度和压缩效果），而非生产级部署
 
 ---
 
@@ -420,24 +467,27 @@ def forward(self, inputs):
 
 ### 7.1 已验证的精度方案
 
-| 方案 | camera/neck | fuser | decoder/backbone | decoder/neck | NDS | 引擎总大小 | 压缩比 |
-|------|------------|-------|-----------------|-------------|-----|-----------|--------|
-| A: 全 FP32 TRT | FP32 | FP32 | FP32 | FP32 | 0.5800 | 42.6 MB | 3.7x |
-| B: 全 FP16 TRT | FP16 | FP16 | FP16 | FP16 | 0.5795 | 13.5 MB | **11.5x** |
-| C: 全 INT8 TRT | INT8 | INT8 | INT8 | INT8 | 0.5723 | 7.2 MB | **21.6x** |
+| 方案 | camera/neck | fuser | decoder/backbone | decoder/neck | NDS | 引擎总大小 | 模块压缩比 |
+|------|------------|-------|-----------------|-------------|-----|-----------|-----------|
+| A: 全 FP32 TRT | FP32 | FP32 | FP32 | FP32 | 0.5800 | 42.6 MB | 0.62x（引擎含编译代码，大于纯权重） |
+| B: 全 FP16 TRT | FP16 | FP16 | FP16 | FP16 | 0.5795 | 13.5 MB | **1.96x** |
+| C: 全 INT8 TRT | INT8 | INT8 | INT8 | INT8 | 0.5723 | 7.2 MB | **3.68x** |
+
+> **压缩比说明**：此处的压缩比是相对于 4 个模块的 FP32 权重（26.51 MB）计算的，而非全模型 155.9 MB。TRT FP32 引擎（42.6 MB）反而比纯权重大，是因为引擎中包含编译后的 CUDA 执行计划（kernel code），不仅仅是权重。
 
 ### 7.2 分析与建议
 
 **方案 B（全 FP16，推荐部署方案）**：
 - NDS 仅下降 0.0005（在统计噪声范围内），可视为无损
 - 各模块余弦相似度均 ≥ 0.999993，数值误差极小
-- 压缩 11.5 倍，模型从 156 MB 缩小到 13.5 MB
+- 4 个 TRT 模块从 26.5 MB 压缩到 13.5 MB
 - **强烈推荐作为默认部署方案**
 
 **方案 C（全 INT8，最大压缩）**：
 - NDS 下降 0.0077（约 1.3%），在大多数应用场景下可接受
-- 压缩 21.6 倍，模型仅 7.2 MB
+- 4 个 TRT 模块压缩到仅 7.2 MB（3.68 倍）
 - 适合对模型大小和推理速度要求极高的边缘设备部署
+- **注意**：未量化的模块（SwinTransformer 等）仍需 129.4 MB FP32 权重，总部署体积约 136.6 MB
 
 **未验证的混合方案**（可进一步探索）：
 - 将 fuser 和 camera/neck 设为 FP16，decoder 设为 INT8
@@ -571,7 +621,9 @@ def forward(self, inputs):
 | dec_backbone | 28,905 KB | 8,442 KB | 4,307 KB |
 | dec_neck | 1,207 KB | 692 KB | 585 KB |
 | **总计** | **42.6 MB** | **13.5 MB** | **7.2 MB** |
-| **压缩比（vs 156.1 MB .pth）** | **3.7x** | **11.5x** | **21.6x** |
+| **压缩比（vs 4 模块 FP32 权重 26.51 MB）** | — | **1.96x** | **3.68x** |
+
+> ⚠️ **压缩比澄清**：上表的压缩比是相对于这 4 个模块在 .pth 中的 FP32 权重大小（26.51 MB）计算的。之前版本文档中使用的 "vs 156.1 MB" 压缩比（21.6x）是不准确的，因为 156.1 MB 包含了所有模块（其中 SwinTransformer 独占 105.2 MB / 67.5%），而这些未量化模块的权重在部署时仍需加载。实际部署总大小 = TRT 引擎 + 未量化模块权重（129.4 MB）。
 
 > decoder/backbone（SECOND）是最大的模块（28.9 MB FP32 引擎），包含多层 Conv2d + BN + ReLU。INT8 后缩小到 4.3 MB（6.7 倍压缩）。
 
@@ -666,25 +718,42 @@ NVIDIA 官方提供了 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_A
 1. **在完整 nuScenes 数据集上验证**  
    下载 nuScenes v1.0-trainval（约 300 GB），在 6,019 帧验证集上重跑 PTQ 和 TRT Hybrid 评估。这将提供论文级别的可信度，并覆盖 mini 数据集缺失的 3 个类别。
 
-2. **逐模块混合精度 TRT 方案**  
+2. **推理速度测量**  
+   当前缺少 Hybrid TRT 的推理时间数据。在 `trt_eval_hybrid_all.py` 中添加计时代码，测量 FP32/FP16/INT8 的端到端推理延迟。这是评估实际加速效果的关键指标。
+
+3. **逐模块混合精度 TRT 方案**  
    修改 `trt_eval_hybrid_all.py` 支持逐模块精度设置（如 fuser 用 FP16、decoder 用 INT8），验证是否能在更少精度损失的前提下保持高压缩率。
 
 ### 11.2 中期（方法改进）
 
-3. **更先进的校准策略**  
+3. **更换主干网络为量化友好的 CNN（推荐，影响最大）**  
+   SwinTransformer 占全模型 67.5% 参数（105.2 MB）但无法量化，是总体压缩的最大障碍。替换为量化友好的 CNN 主干可大幅提高量化覆盖率：
+   
+   | 候选主干 | 参数量 | fx 兼容性 | 预期影响 |
+   |---------|--------|----------|---------|
+   | **ResNet-50 + FPN** | ~25M | ✅ 完全兼容 | NDS 可能下降 2-5%，但可全量化 |
+   | ResNet-101 + FPN | ~44M | ✅ 完全兼容 | 精度接近 SwinT |
+   | **ConvNeXt-Tiny** | ~28M | ✅ 基本兼容 | 纯卷积的 Transformer 替代，精度接近 SwinT |
+   | EfficientNet-B4 | ~19M | ✅ 基本兼容 | 参数更少 |
+   
+   BEVFusion 的 camera backbone 是配置化的，理论上只需修改 config 并重新训练。注意 NVIDIA 官方 CUDA-BEVFusion 也使用了 ResNet50（见第 10 节），这验证了 ResNet 主干在 BEV 感知任务中是可行的。
+   
+   如果使用 ResNet-50 替换 SwinTransformer，则 camera/backbone 也可量化导出 TRT，预计量化覆盖率可达 **5/6 模块，约 85% 参数**，总模型大小可能压缩到 20-30 MB 级别。
+
+4. **更先进的校准策略**  
    当前使用最朴素的 MinMax 校准。可尝试：
    - **Histogram / Percentile 校准**：裁剪掉极端值，可能改善 INT8 精度
    - **AdaRound**（MQBench 支持）：学习最优的 round-to-nearest 策略
    - **Per-channel 量化**：TRT 支持 per-channel INT8，可能改善精度
 
-4. **SwinTransformer 量化探索**  
-   SwinTransformer 是 BEVFusion 中计算最密集的模块。虽然 `torch.fx` 追踪有动态控制流障碍，但可以尝试：
+5. **SwinTransformer 量化探索（不更换主干的替代方案）**  
+   如果不想更换主干网络，可以尝试绕过 torch.fx 的限制：
    - 传 `concrete_args` 固定输入尺寸，让 fx 常量化分支条件
-   - 使用 `torch.fx.Tracer` 的自定义子类，标记特定函数为 leaf
-   - 考虑 FX-free 的量化方式（手动插入 QuantStub/DeQuantStub）
+   - 手动插入 QuantStub/DeQuantStub，不依赖 fx 自动追踪
+   - 直接导出 ONNX → TRT 原生 INT8 校准（需验证 `roll`/`window_partition` 的 ONNX 兼容性）
 
-5. **TransFusionHead 量化**  
-   检测头中的 Attention 层和 FFN 层也可以量化。障碍是 `ModuleList` 动态迭代，可通过静态展开（unroll）解决。
+6. **TransFusionHead 量化**  
+   检测头中的 Attention 层和 FFN 层也可以量化。障碍是 `ModuleList` 动态迭代，可通过静态展开（unroll）解决。参数量小（1.04M / 2.5%），优先级低于 SwinTransformer。
 
 ### 11.3 长期（部署落地）
 
@@ -703,11 +772,13 @@ NVIDIA 官方提供了 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_A
 
 本项目成功实现了 BEVFusion 的选择性混合精度量化与 TensorRT 部署：
 
-1. **量化覆盖**：6 个可量化模块中成功量化 4 个（decoder/backbone、decoder/neck、camera/neck、fuser），覆盖率 67%
+1. **量化覆盖**：6 个可量化模块中成功量化 4 个（decoder/backbone、decoder/neck、camera/neck、fuser），覆盖率 67%。但这 4 个模块仅占全模型参数量的 17%（26.51 MB / 155.9 MB），因为 SwinTransformer 独占 67.5% 的参数量且无法量化
 2. **PTQ 精度**：MinMax PTQ 实现零精度损失（NDS +0.0009），验证了 BEVFusion 中后段管线对 INT8 量化的高容忍度
-3. **TRT 全模块部署**：4 个模块全部导出为 TRT 引擎，INT8 模式下引擎总大小仅 7.2 MB（原 .pth 156.1 MB，压缩 21.6 倍），NDS 下降约 1.3%
-4. **FP16 推荐方案**：TRT FP16 引擎 13.5 MB（压缩 11.5 倍），NDS 几乎无损（−0.0005），是精度和压缩的最佳平衡
+3. **TRT 全模块部署**：4 个模块全部导出为 TRT 引擎，INT8 模式下引擎总大小仅 7.2 MB（相对于这 4 个模块的 FP32 权重 26.51 MB，压缩 3.68 倍），NDS 下降约 1.3%
+4. **FP16 推荐方案**：TRT FP16 引擎 13.5 MB，NDS 几乎无损（−0.0005），是精度和压缩的最佳平衡
 5. **Hybrid 架构**：验证了分段 TRT 部署的可行性——TRT 引擎与 PyTorch 通过 CUDA 显存零拷贝无缝协作
 6. **工程价值**：建立了完整的 PTQ → FakeQuant 评估 → ONNX 导出 → TRT 引擎构建 → Hybrid 端到端验证的工具链
 
-核心发现是：**BEVFusion 的 BEV 中后段管线（neck → fuser → decoder）对量化极其友好**，即使使用最朴素的 MinMax 策略也能无损量化。全模块 TRT INT8 部署在 mini 数据集上仅损失 1.3% NDS，同时实现 21.6 倍模型压缩。这为 BEV 感知模型的部署优化提供了有价值的参考。
+核心发现是：**BEVFusion 的 BEV 中后段管线（neck → fuser → decoder）对量化极其友好**，即使使用最朴素的 MinMax 策略也能无损量化。全模块 TRT INT8 部署在 mini 数据集上仅损失 1.3% NDS。
+
+**但必须正视的局限**：由于 SwinTransformer（67.5% 参数）和 SpConv（6.6% 参数）无法量化，当前方案对总模型大小的压缩有限（总部署体积仍约 136.6 MB）。**要实现真正显著的全模型压缩，需要解决 SwinTransformer 的量化问题**——最可行的方向是更换为量化友好的主干网络（如 ResNet-50），或使用不依赖 torch.fx 的量化方案。
