@@ -269,3 +269,89 @@ MinMax PTQ 是最朴素的量化方法（仅记录 min/max 确定量化范围）
 - **TRT INT8 精度下降 1.3%（NDS）**：这是仅替换 ConvFuser 一个模块的结果。INT8 余弦相似度 0.936 较低，主因是 ConvFuser 输出动态范围大（0~155），INT8 量化分辨率有限
 - **推荐方案**：TRT FP16 兼顾精度（无损）和压缩（3.49x），是最佳部署选择
 - 此评估仅替换 ConvFuser（占整体推理时间约 1%），端到端加速需替换更多模块（backbone、neck）
+
+---
+
+## 2026-02-26 22:40 · TRT Hybrid 全模块端到端 NDS 评估（4 模块替换为 TRT 引擎）
+
+**环境**：RTX 4060 Laptop（Ada，Compute 8.9），TensorRT 10.15.1.29，PyTorch 1.10.2+cu113
+
+**方法**：`tools/trt_eval_hybrid_all.py`。将全部 4 个可量化模块（camera/neck、fuser、decoder/backbone、decoder/neck）分别导出为 ONNX，通过 TRT 构建 FP32/FP16/INT8 引擎，在完整推理管线中替换全部 4 个模块，运行全量验证集（81 样本）NDS/mAP 评估。INT8 使用 TRT `IInt8EntropyCalibrator2`（50 样本真实特征校准）。
+
+### 精度（端到端 NDS 评估，4 模块替换）
+
+| 方法 | NDS | mAP | NDS 变化 | mAP 变化 |
+|------|------|------|---------|---------|
+| PyTorch FP32（基线） | 0.5800 | 0.5744 | — | — |
+| TRT FP32（4 模块） | **0.5800** | **0.5744** | **+0.0000** | **+0.0000** |
+| TRT FP16（4 模块） | **0.5795** | **0.5743** | **−0.0005** | **−0.0001** |
+| TRT INT8（4 模块） | **0.5723** | **0.5652** | **−0.0077** | **−0.0092** |
+
+### 余弦相似度（各模块输出，TRT vs PyTorch）
+
+| 模块 | FP32 cos | FP32 maxErr | FP16 cos | FP16 maxErr | INT8 cos | INT8 maxErr |
+|------|----------|------------|----------|------------|----------|------------|
+| camera_neck[0] | 1.000000 | 0.0054 | 0.999996 | 0.0430 | — | — |
+| camera_neck[1] | 1.000000 | 0.0041 | 0.999995 | 0.0352 | — | — |
+| fuser[0] | 1.000000 | 0.0252 | 0.999998 | 0.3125 | — | — |
+| dec_backbone[0] | 1.000000 | 0.0079 | 0.999996 | 0.0391 | — | — |
+| dec_backbone[1] | 1.000000 | 0.0072 | 0.999993 | 0.0355 | — | — |
+| dec_neck[0] | 1.000000 | 0.0018 | 1.000000 | 0.0049 | — | — |
+
+> INT8 余弦相似度未记录（TRT INT8 模式下 sanity check 结果可能受校准数据影响波动较大）。
+
+### 引擎大小
+
+| 模块 | FP32 | FP16 | INT8 |
+|------|------|------|------|
+| camera_neck | 8,157 KB | 3,183 KB | 1,690 KB |
+| fuser | 5,401 KB | 1,543 KB | 833 KB |
+| dec_backbone | 28,905 KB | 8,442 KB | 4,307 KB |
+| dec_neck | 1,207 KB | 692 KB | 585 KB |
+| **总计** | **42.6 MB** | **13.5 MB** | **7.2 MB** |
+| **压缩比（vs 156.1 MB .pth）** | **3.7x** | **11.5x** | **21.6x** |
+
+### 逐类 AP 对比（TRT INT8 vs FP32 基线）
+
+| 类别 | FP32 | TRT INT8 | 变化 |
+|------|------|----------|------|
+| car | 0.919 | 0.911 | −0.008 |
+| truck | 0.824 | 0.789 | −0.035 |
+| bus | 0.995 | 0.993 | −0.002 |
+| pedestrian | 0.917 | 0.929 | +0.012 |
+| motorcycle | 0.707 | 0.695 | −0.012 |
+| bicycle | 0.528 | 0.526 | −0.002 |
+| traffic_cone | 0.852 | 0.810 | −0.042 |
+| trailer | 0.000 | 0.000 | —（mini 集样本不足） |
+| construction_vehicle | 0.000 | 0.000 | —（mini 集样本不足） |
+| barrier | 0.000 | 0.000 | —（mini 集样本不足） |
+
+### 总结
+
+- **TRT FP32 完全无损**：NDS 差异 0.0000，4 个模块输出余弦相似度均为 1.000000
+- **TRT FP16 几乎无损**：NDS Δ=−0.0005，mAP Δ=−0.0001，可忽略不计
+- **TRT INT8 精度下降约 1.3%（NDS）**：NDS Δ=−0.0077，主要受 fuser 的大动态范围输出量化影响
+- **压缩效果显著**：INT8 全模块引擎仅 7.2 MB（原 .pth 156.1 MB，21.6 倍压缩）
+- **推荐方案**：
+  - 精度优先 → TRT FP16（NDS 无损，11.5x 压缩）
+  - 速度/大小优先 → TRT INT8（NDS −1.3%，21.6x 压缩）
+- **vs 上次仅 ConvFuser 替换**：全模块替换使压缩比从 6.35x（单模块 INT8）提升至 21.6x（4 模块 INT8），这是因为 decoder/backbone 占模型参数量最大比例
+
+### 导出文件（精度=fp32 为例）
+
+| 文件 | 大小 |
+|------|------|
+| `runs/trt_hybrid_all/camera_neck_fp32.onnx` | ONNX 格式 |
+| `runs/trt_hybrid_all/camera_neck_fp32.engine` | 8,157 KB |
+| `runs/trt_hybrid_all/fuser_fp32.engine` | 5,401 KB |
+| `runs/trt_hybrid_all/dec_backbone_fp32.engine` | 28,905 KB |
+| `runs/trt_hybrid_all/dec_neck_fp32.engine` | 1,207 KB |
+
+### 未替换模块
+
+| 子模块 | 原因 |
+|--------|------|
+| camera/backbone（SwinTransformer） | 动态控制流（window attention），fx 追踪失败 |
+| heads/object（TransFusionHead） | Proxy 迭代问题，fx 追踪失败 |
+
+> 这两个模块仍以 PyTorch FP32 运行。SwinTransformer 参数量约占全模型 30%，如能量化将进一步压缩。但其动态控制流需要 `torch.fx` 以外的量化方案（如 TensorRT 原生 ONNX 导出或手工算子替换）。

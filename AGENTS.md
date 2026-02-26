@@ -32,7 +32,8 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 | `tools/quant_ptq_minmax.py` | ✅ | NDS = 0.5810（PTQ 4/6 模块量化，精度无损，+0.0009 vs FP32） |
 | `tools/quant_benchmark.py` | ✅ | 可运行 |
 | `tools/trt_export_fuser.py` | ✅ | ConvFuser TRT PoC：INT8 6.81x 加速 |
-| `tools/trt_eval_hybrid.py` | ✅ | TRT Hybrid 端到端评估：FP32 NDS=0.5801, FP16 NDS=0.5799, INT8 NDS=0.5727 |
+| `tools/trt_eval_hybrid.py` | ✅ | TRT Hybrid 端到端评估（仅 fuser）：FP32 NDS=0.5801, FP16 NDS=0.5799, INT8 NDS=0.5727 |
+| `tools/trt_eval_hybrid_all.py` | ✅ | TRT Hybrid 全模块评估（4 模块）：FP32 NDS=0.5800, FP16 NDS=0.5795, INT8 NDS=0.5723 |
 | `tools/train.py` | ⚠️ | NaN 修复已应用但未验证 |
 
 ## 关键约束（务必遵守）
@@ -76,13 +77,22 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 ✅ **ConvFuser PoC 已完成**：FP32 ONNX → TRT INT8 引擎，6.81x 加速、6.48x 压缩。
 
+✅ **全模块 TRT 导出已完成**：4/4 可量化模块均已导出为 TRT 引擎。
+
 **已验证的导出方案**：
 - MQBench `convert_deploy` / `torch.onnx.export` 均无法导出 FakeQuant 模型（PyTorch 1.10 限制）
 - 可行方案：导出 FP32 ONNX → TRT `IInt8EntropyCalibrator2` 原生 INT8 校准
-- 参考脚本：`tools/trt_export_fuser.py`
+- 单模块脚本：`tools/trt_export_fuser.py`
+- 全模块脚本：`tools/trt_eval_hybrid_all.py`
 
-**待推广到其余模块**：
-1. decoder/backbone（SECOND）→ 确定输入 shape，编写 wrapper
-2. decoder/neck（SECONDFPN）→ 含 ConvTranspose2d，编写 wrapper
-3. camera/neck（GeneralizedLSSFPN）→ 多尺度输入，编写 wrapper
-4. 编写 Hybrid Runner 整合 TRT 引擎 + PyTorch 推理
+**全模块导出结果**：
+
+| 精度 | NDS | 引擎总大小 | 压缩比 |
+|------|-----|-----------|--------|
+| FP32 | 0.5800 | 42.6 MB | 3.7x |
+| FP16 | 0.5795 | 13.5 MB | 11.5x |
+| INT8 | 0.5723 | 7.2 MB | 21.6x |
+
+**未量化模块**（仍以 PyTorch FP32 运行）：
+- camera/backbone（SwinTransformer）— 动态控制流
+- heads/object（TransFusionHead）— Proxy 迭代问题

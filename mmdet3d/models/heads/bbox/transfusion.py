@@ -174,7 +174,8 @@ class TransFusionHead(nn.Module):
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
         # NOTE: modified
         batch_x, batch_y = torch.meshgrid(
-            *[torch.linspace(it[0], it[1], it[2]) for it in meshgrid]
+            *[torch.linspace(it[0], it[1], it[2]) for it in meshgrid],
+            indexing="ij",
         )
         batch_x = batch_x + 0.5
         batch_y = batch_y + 0.5
@@ -270,7 +271,7 @@ class TransFusionHead(nn.Module):
         top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[
             ..., : self.num_proposals
         ]
-        top_proposals_class = top_proposals // heatmap.shape[-1]
+        top_proposals_class = torch.div(top_proposals, heatmap.shape[-1], rounding_mode='trunc')
         top_proposals_index = top_proposals % heatmap.shape[-1]
         query_feat = lidar_feat_flatten.gather(
             index=top_proposals_index[:, None, :].expand(

@@ -130,6 +130,8 @@ python tools/quant_benchmark.py `
 ```powershell
 $env:PYTHONUTF8="1"
 python tools/trt_eval_hybrid.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    pretrained/bevfusion-det.pth `
     --precision fp32 `
     --calib-samples 128 2>&1 | Tee-Object -FilePath "results_trt_hybrid_fp32.log"
 ```
@@ -141,6 +143,8 @@ python tools/trt_eval_hybrid.py `
 ```powershell
 $env:PYTHONUTF8="1"
 python tools/trt_eval_hybrid.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    pretrained/bevfusion-det.pth `
     --precision fp16 `
     --calib-samples 128 2>&1 | Tee-Object -FilePath "results_trt_hybrid_fp16.log"
 ```
@@ -152,6 +156,8 @@ python tools/trt_eval_hybrid.py `
 ```powershell
 $env:PYTHONUTF8="1"
 python tools/trt_eval_hybrid.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    pretrained/bevfusion-det.pth `
     --precision int8 `
     --calib-samples 128 2>&1 | Tee-Object -FilePath "results_trt_hybrid_int8.log"
 ```
@@ -163,10 +169,59 @@ python tools/trt_eval_hybrid.py `
 ```powershell
 $env:PYTHONUTF8="1"
 python tools/trt_eval_hybrid.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    pretrained/bevfusion-det.pth `
     --precision int8 `
     --calib-samples 128 `
     --debug 2>&1 | Tee-Object -FilePath "results_trt_hybrid_debug.log"
 ```
+
+---
+
+## 8. TRT Hybrid 全模块端到端 NDS 评估（4 模块替换）
+
+**数据来源**：RESULTS_LOG「TRT Hybrid 全模块端到端 NDS 评估」
+
+> 前提：已安装 TensorRT（`pip install tensorrt`）
+> 
+> 此脚本将 camera/neck、fuser、decoder/backbone、decoder/neck 四个模块全部导出为 TRT 引擎并替换。
+
+### FP32 精度
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/trt_eval_hybrid_all.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    pretrained/bevfusion-det.pth `
+    --precision fp32 2>&1 | Tee-Object -FilePath "results_trt_all_fp32.log"
+```
+
+**预期输出**：NDS ≈ 0.5800, mAP ≈ 0.5744, 全引擎 42.6 MB（3.7x 压缩）
+
+### FP16 精度
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/trt_eval_hybrid_all.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    pretrained/bevfusion-det.pth `
+    --precision fp16 2>&1 | Tee-Object -FilePath "results_trt_all_fp16.log"
+```
+
+**预期输出**：NDS ≈ 0.5795, mAP ≈ 0.5743, 全引擎 13.5 MB（11.5x 压缩）
+
+### INT8 精度（需校准）
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/trt_eval_hybrid_all.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    pretrained/bevfusion-det.pth `
+    --precision int8 `
+    --calib-samples 50 2>&1 | Tee-Object -FilePath "results_trt_all_int8.log"
+```
+
+**预期输出**：NDS ≈ 0.5723, mAP ≈ 0.5652, 全引擎 7.2 MB（21.6x 压缩）
 
 ---
 
@@ -186,3 +241,6 @@ python tools/trt_eval_hybrid.py `
 | `results_trt_hybrid_fp16.log` | TRT Hybrid FP16 端到端 NDS |
 | `results_trt_hybrid_int8.log` | TRT Hybrid INT8 端到端 NDS |
 | `results_trt_hybrid_debug.log` | TRT Hybrid 调试模式输出 |
+| `results_trt_all_fp32.log` | TRT 全模块 Hybrid FP32 端到端 NDS |
+| `results_trt_all_fp16.log` | TRT 全模块 Hybrid FP16 端到端 NDS |
+| `results_trt_all_int8.log` | TRT 全模块 Hybrid INT8 端到端 NDS |

@@ -777,7 +777,7 @@ def points_in_convex_polygon_3d_jit(points, polygon_surfaces, num_surfaces=None)
     return _points_in_convex_polygon_3d_jit(points, polygon_surfaces, normal_vec, d, num_surfaces)
 
 
-@numba.jit
+@numba.jit(nopython=True)
 def points_in_convex_polygon_jit(points, polygon, clockwise=True):
     """Check points is in 2d convex polygons. True when point in polygon.
 
