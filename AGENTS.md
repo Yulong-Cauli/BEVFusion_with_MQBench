@@ -18,11 +18,11 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 ## 项目文档
 
-- `CLIlog.md`：完整历史修复记录，包含环境信息和所有已知 bug 修复
 - `docs/PTQ_BENCHMARK_NOTES.md`：量化覆盖问题分析、Benchmark 命令、TensorRT 导出方案、当前开放问题
 - `docs/RESULTS_LOG.md`：评测结果记录（FP32 vs PTQ 精度 / 速度 / 大小）
+- `docs/REPORT.md`：完整技术报告
 
-**开始任务前请先阅读以上三个文档。**
+**开始任务前请先阅读以上文档。**
 
 ## 当前已验证可工作的脚本
 
@@ -34,7 +34,6 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 | `tools/trt_export_fuser.py` | ✅ | ConvFuser TRT PoC：INT8 6.81x 加速 |
 | `tools/trt_eval_hybrid.py` | ✅ | TRT Hybrid 端到端评估（仅 fuser）：FP32 NDS=0.5801, FP16 NDS=0.5799, INT8 NDS=0.5727 |
 | `tools/trt_eval_hybrid_all.py` | ✅ | TRT Hybrid 全模块评估（4 模块）：FP32 NDS=0.5800, FP16 NDS=0.5795, INT8 NDS=0.5723 |
-| `tools/train.py` | ⚠️ | NaN 修复已应用但未验证 |
 
 ## 关键约束（务必遵守）
 
@@ -70,9 +69,6 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 3. **困难**：`camera/backbone`（SwinTransformer）、`heads/object`（TransFusionHead）
    - 见 PTQ_BENCHMARK_NOTES.md 的详细分析
 
-### 次要：验证训练
-- 跑 `tools/train.py` 约 100 步确认 `grad_norm` 不再出现 NaN（已在 `configs/default.yaml` 加 `init_scale: 512`）
-
 ### 下一步：TensorRT INT8 导出（见 PTQ_BENCHMARK_NOTES.md 第五节问题 2）
 
 ✅ **ConvFuser PoC 已完成**：FP32 ONNX → TRT INT8 引擎，6.81x 加速、6.48x 压缩。
@@ -80,6 +76,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 ✅ **全模块 TRT 导出已完成**：4/4 可量化模块均已导出为 TRT 引擎。
 
 **已验证的导出方案**：
+
 - MQBench `convert_deploy` / `torch.onnx.export` 均无法导出 FakeQuant 模型（PyTorch 1.10 限制）
 - 可行方案：导出 FP32 ONNX → TRT `IInt8EntropyCalibrator2` 原生 INT8 校准
 - 单模块脚本：`tools/trt_export_fuser.py`

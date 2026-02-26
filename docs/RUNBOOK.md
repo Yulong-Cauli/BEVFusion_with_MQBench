@@ -77,9 +77,9 @@ python tools/quant_benchmark.py `
 
 ---
 
-## 4. ConvFuser TensorRT 导出 PoC（INT8 6.81x 加速）
+## 4. ConvFuser TensorRT 导出（单模块，已被第 8 节全模块方案取代）
 
-**数据来源**：RESULTS_LOG「ConvFuser TensorRT 导出 Proof-of-Concept」
+> ⚠️ **此节为历史参考**。全模块 TRT 导出请使用第 8 节 `trt_eval_hybrid_all.py`。
 
 > 前提：已安装 TensorRT（`pip install tensorrt`）
 
@@ -93,9 +93,9 @@ python tools/trt_export_fuser.py `
 
 ---
 
-## 5. ConvFuser TRT 精度验证（余弦相似度）
+## 5. ConvFuser TRT 精度验证（单模块，已被第 8 节全模块方案取代）
 
-**数据来源**：RESULTS_LOG「精度验证（真实预训练权重）」
+> ⚠️ **此节为历史参考**。全模块 TRT 精度验证请使用第 8 节。
 
 ```powershell
 $env:PYTHONUTF8="1"
@@ -119,9 +119,9 @@ python tools/quant_benchmark.py `
 
 ---
 
-## 7. TRT Hybrid 端到端 NDS 评估
+## 7. TRT Hybrid 端到端 NDS 评估（单模块，已被第 8 节全模块方案取代）
 
-**数据来源**：RESULTS_LOG「TensorRT Hybrid 端到端 NDS 评估」
+> ⚠️ **此节为历史参考**。全模块 TRT Hybrid 评估请使用第 8 节 `trt_eval_hybrid_all.py`。
 
 > 前提：已安装 TensorRT（`pip install tensorrt`）
 

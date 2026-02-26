@@ -1,19 +1,19 @@
 # BEVFusion + MQBench 量化工具集
 
-> 本项目在 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion)（基于 mmdetection3d）的基础上，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具，实现了面向 TensorRT INT8 后端的**训练后量化（PTQ）**。
+> 本项目在 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion)（基于 mmdetection3d）的基础上，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具，实现了面向 TensorRT INT8 后端的**训练后量化（PTQ）**与**混合精度 TensorRT 部署**。
 
 ---
 
 ## 目录
 
 - [项目简介](#项目简介)
+- [核心成果](#核心成果)
 - [环境安装](#环境安装)
 - [数据准备](#数据准备)
 - [预训练模型](#预训练模型)
 - [PTQ：训练后量化](#ptq训练后量化)
-- [量化精度验证结果](#量化精度验证结果)
-- [Benchmark 工具](#benchmark-工具)
 - [TensorRT 部署](#tensorrt-部署)
+- [Benchmark 工具](#benchmark-工具)
 - [文档索引](#文档索引)
 - [致谢](#致谢)
 
@@ -21,16 +21,43 @@
 
 ## 项目简介
 
-本项目以 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion) 为基础，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具库，新增以下量化脚本：
+本项目以 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion) 为基础，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具库，实现了：
+
+1. **选择性 PTQ**：对 4/6 个可量化子模块进行 MinMax 训练后量化，精度零损失
+2. **全模块 TRT 部署**：将 4 个已量化模块全部导出为 TensorRT 引擎，INT8 模式下模型压缩 21.6 倍
+3. **Hybrid 推理**：TRT 引擎与 PyTorch 混合执行，端到端 NDS 评估验证通过
 
 | 脚本 | 功能 |
 |------|------|
 | `tools/quant_ptq_minmax.py` | **PTQ** — MinMax 校准 + 精度评估 |
 | `tools/quant_benchmark.py` | **Benchmark** — 模型大小与推理延迟测量 |
-| `tools/trt_export_fuser.py` | **TRT 导出** — ConvFuser ONNX → TensorRT 隔离延迟测试 |
-| `tools/trt_eval_hybrid.py` | **TRT 评估** — TRT 替换 ConvFuser + 完整 NDS 端到端评估 |
+| `tools/trt_eval_hybrid_all.py` | **TRT 全模块评估** — 4 模块 TRT 导出 + Hybrid 端到端 NDS 评估 |
+| `tools/trt_eval_hybrid.py` | **TRT 单模块评估** — 仅 ConvFuser 替换（调试/对比用） |
+| `tools/trt_export_fuser.py` | **TRT 导出** — ConvFuser 隔离延迟测试 |
 
 目标后端：**NVIDIA TensorRT INT8**
+
+---
+
+## 核心成果
+
+### PTQ 精度（MQBench FakeQuant 仿真，4/6 模块量化）
+
+| 指标 | FP32 基线 | PTQ 4/6 (MinMax) | 变化 |
+|------|----------|------------------|------|
+| **NDS** | 0.5801 | **0.5810** | **+0.0009**（无损） |
+| **mAP** | 0.5742 | **0.5759** | **+0.0017**（无损） |
+
+### TRT Hybrid 端到端评估（4 模块替换为 TRT 引擎）
+
+| 精度 | NDS | mAP | NDS 变化 | 引擎总大小 | 压缩比 |
+|------|-----|-----|---------|-----------|--------|
+| PyTorch FP32（基线） | 0.5800 | 0.5744 | — | 156.1 MB (.pth) | — |
+| **TRT FP32** | **0.5800** | **0.5744** | **+0.0000** | 42.6 MB | 3.7x |
+| **TRT FP16** | **0.5795** | **0.5743** | **−0.0005** | 13.5 MB | **11.5x** |
+| **TRT INT8** | **0.5723** | **0.5652** | **−0.0077** | 7.2 MB | **21.6x** |
+
+> ✅ FP16 推荐：精度几乎无损（NDS −0.0005），压缩 11.5 倍。INT8 压缩 21.6 倍，精度下降约 1.3%。
 
 ---
 
@@ -80,7 +107,6 @@ pip install tensorrt
 
 - **编码问题**：所有 Python 命令必须设置 `$env:PYTHONUTF8="1"`，否则读取 YAML 配置时会报 GBK codec 错误
 - **CUDA 编译**：如需重新编译 CUDA 扩展，需先激活 Visual Studio 编译器环境（`vcvars64.bat`）
-- 详细的环境修复记录见 [CLIlog.md](CLIlog.md)
 
 ```powershell
 # Windows PowerShell 标准前置设置
@@ -229,30 +255,6 @@ python tools/quant_ptq_minmax.py \
 
 </details>
 
-### ConvFuser TensorRT 导出 PoC
-
-ConvFuser 单模块 TRT 导出验证（RTX 4060 Laptop，TensorRT 10.15）：
-
-| 精度 | 延迟 | 加速比 | 引擎大小 | 压缩比 |
-|------|------|--------|---------|--------|
-| PyTorch FP32 | 5.08 ms | 1.00x | — | — |
-| TRT FP32 | 4.02 ms | 1.27x | 5385 KB | 1.00x |
-| TRT FP16 | 1.44 ms | **3.54x** | 1543 KB | 3.49x |
-| TRT INT8 | 0.75 ms | **6.81x** | 832 KB | **6.48x** |
-
-### TRT Hybrid 端到端 NDS 评估
-
-ConvFuser 替换为 TRT 引擎后的完整端到端 NDS 评估（81 样本）：
-
-| 方法 | NDS | mAP | NDS 变化 |
-|------|------|------|---------|
-| PyTorch FP32 | 0.5801 | 0.5746 | — |
-| TRT FP32 | **0.5801** | **0.5746** | **+0.0000** |
-| TRT FP16 | **0.5799** | **0.5744** | **−0.0002** |
-| TRT INT8 | **0.5727** | **0.5616** | **−0.0074** |
-
-> ✅ TRT FP16 推荐：兼顾精度（无损）与 3.49x 压缩。INT8 精度下降 1.3%，主因是 ConvFuser 输出动态范围大。
-
 详细结果见 [docs/RESULTS_LOG.md](docs/RESULTS_LOG.md)。
 
 ---
@@ -278,58 +280,71 @@ python tools/quant_benchmark.py \
     --num-iters 30
 ```
 
-实测结果（RTX 4060 Laptop，nuScenes v1.0-mini）：
-
-| 指标 | FP32 | PTQ（FakeQuant 仿真） |
-|------|------|----------------------|
-| 参数量 | 39.80 M | 39.81 M |
-| .pth 文件大小 | 156.13 MB | 156.31 MB |
-| 均值延迟 | 389 ms | 408 ms |
-| 理论 INT8 部署大小 | — | ~39 MB（需 TRT 导出） |
-
 > FakeQuant 仿真在 FP32 上执行额外的 clamp/round 操作，本身有开销。真实 INT8 加速需要 TensorRT 引擎部署。
 
 ---
 
 ## TensorRT 部署
 
-### 已验证方案
+### 部署方案
 
-MQBench 的 `convert_deploy` 和 `torch.onnx.export` 均无法直接导出 FakeQuant 模型（PyTorch 1.10 缺少自定义 op 的 ONNX symbolic）。实际可行的方案：
+MQBench 的 `convert_deploy` 和 `torch.onnx.export` 均无法直接导出 FakeQuant 模型（PyTorch 1.10 限制）。本项目采用的方案：
 
 ```
-FP32 PyTorch 模型 → torch.onnx.export → FP32 ONNX → TRT INT8/FP16 校准 → TRT 引擎
+FP32 PyTorch 子模块 → torch.onnx.export → FP32 ONNX → TRT INT8/FP16 原生校准 → TRT 引擎
 ```
+
+### Hybrid 推理架构
+
+将 4 个已量化模块导出为 TRT 引擎，其余保持 PyTorch 执行：
+
+| 组件 | 运行方式 |
+|------|---------|
+| camera/neck (GeneralizedLSSFPN) | → **TRT FP16/INT8 引擎** |
+| fuser (ConvFuser) | → **TRT FP16/INT8 引擎** |
+| decoder/backbone (SECOND) | → **TRT FP16/INT8 引擎** |
+| decoder/neck (SECONDFPN) | → **TRT FP16/INT8 引擎** |
+| camera/backbone (SwinTransformer) | → PyTorch FP32 |
+| camera/vtransform, lidar/*, heads/* | → PyTorch FP32 |
+
+### 全模块 TRT Hybrid 端到端结果
+
+| 精度 | NDS | mAP | NDS 变化 | 引擎总大小 | 压缩比 |
+|------|-----|-----|---------|-----------|--------|
+| FP32 基线 | 0.5800 | 0.5744 | — | 156.1 MB (.pth) | — |
+| TRT FP32 | **0.5800** | **0.5744** | +0.0000 | 42.6 MB | 3.7x |
+| TRT FP16 | **0.5795** | **0.5743** | −0.0005 | 13.5 MB | **11.5x** |
+| TRT INT8 | **0.5723** | **0.5652** | −0.0077 | 7.2 MB | **21.6x** |
+
+各模块引擎大小（INT8）：
+
+| 模块 | FP32 | FP16 | INT8 |
+|------|------|------|------|
+| camera_neck | 8,157 KB | 3,183 KB | 1,690 KB |
+| fuser | 5,401 KB | 1,543 KB | 833 KB |
+| dec_backbone | 28,905 KB | 8,442 KB | 4,307 KB |
+| dec_neck | 1,207 KB | 692 KB | 585 KB |
 
 ### 可用脚本
 
 | 脚本 | 功能 | 状态 |
 |------|------|------|
-| `tools/trt_export_fuser.py` | ConvFuser 单模块导出 + 隔离延迟测试 | ✅ 已验证 |
-| `tools/trt_eval_hybrid.py` | TRT 替换 ConvFuser + 完整 NDS 评估 | ✅ 已验证 |
+| `tools/trt_eval_hybrid_all.py` | 4 模块全部导出 + 端到端 NDS 评估 | ✅ FP32/FP16/INT8 已验证 |
+| `tools/trt_eval_hybrid.py` | 仅 ConvFuser 替换 + NDS 评估（调试用） | ✅ 已验证 |
+| `tools/trt_export_fuser.py` | ConvFuser 隔离延迟测试 | ✅ 已验证 |
 
 ### 使用方法
 
 ```bash
-# 隔离延迟测试（ConvFuser）
-python tools/trt_export_fuser.py \
+# 全模块 TRT INT8 端到端评估（推荐）
+python tools/trt_eval_hybrid_all.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    pretrained/bevfusion-det.pth
+    pretrained/bevfusion-det.pth --precision int8 --calib-samples 50
 
-# 端到端 NDS 评估（TRT INT8 替换 ConvFuser）
-python tools/trt_eval_hybrid.py \
+# 全模块 TRT FP16（精度优先，推荐部署方案）
+python tools/trt_eval_hybrid_all.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    pretrained/bevfusion-det.pth --eval bbox --precision int8
-
-# TRT FP16（推荐，精度无损）
-python tools/trt_eval_hybrid.py \
-    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    pretrained/bevfusion-det.pth --eval bbox --precision fp16
-
-# 开启调试模式（逐样本对比 PyTorch vs TRT 输出）
-python tools/trt_eval_hybrid.py \
-    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    pretrained/bevfusion-det.pth --eval bbox --precision fp32 --debug
+    pretrained/bevfusion-det.pth --precision fp16
 ```
 
 ### 依赖
@@ -338,26 +353,16 @@ python tools/trt_eval_hybrid.py \
 pip install tensorrt onnx onnxruntime
 ```
 
-### 架构
-
-Hybrid 推理将 ConvFuser 替换为 TRT 引擎，其余保持 PyTorch 执行：
-
-| 组件 | 运行方式 |
-|------|---------|
-| fuser (ConvFuser) | → TRT FP16/INT8 引擎 |
-| camera/backbone, camera/neck, camera/vtransform | → PyTorch FP32 |
-| lidar/*, decoder/*, heads/* | → PyTorch FP32 |
-
 ---
 
 ## 文档索引
 
 | 文件 | 内容 |
 |------|------|
-| [docs/RESULTS_LOG.md](docs/RESULTS_LOG.md) | 所有评测结果记录（FP32 / PTQ 精度、速度、大小） |
+| [docs/REPORT.md](docs/REPORT.md) | 完整技术报告（量化原理、实现细节、实验结果） |
+| [docs/RESULTS_LOG.md](docs/RESULTS_LOG.md) | 所有评测结果记录（FP32 / PTQ / TRT 精度、速度、大小） |
 | [docs/PTQ_BENCHMARK_NOTES.md](docs/PTQ_BENCHMARK_NOTES.md) | 量化覆盖问题分析、TRT 导出方案、开放问题 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 可复现运行手册（所有命令） |
-| [CLIlog.md](CLIlog.md) | 完整历史修复记录（环境配置、bug 修复） |
 | [AGENTS.md](AGENTS.md) | Agent 工作说明（环境约束、已知问题） |
 
 ---

@@ -69,6 +69,7 @@ except ImportError:
     raise
 
 
+# 临时修补 mmcv 的 Conv/Linear 包装层，使 torch.fx 追踪时不触发 Proxy 布尔判断报错
 @contextmanager
 def patch_mmcv_for_fx():
     """Patch mmcv Conv/ConvTranspose2d wrappers for torch.fx tracing compatibility.
@@ -78,7 +79,18 @@ def patch_mmcv_for_fx():
     becomes ``if Proxy:`` which raises TraceError.  We temporarily replace the
     forward methods with the plain PyTorch parent versions so that fx can trace
     through them.
+
+    用原生 nn.Module 的 forward 替换 mmcv wrapper 的 forward，
+    避免 fx 将条件判断中的 Tensor 变成 Proxy 后导致 TraceError
+
+    MMCV 的行为：它的 forward 函数里包含显式的 Python if 语句（即 if x.numel() == 0）。这属于动态执行流。
+    Torch.fx 的预期：它希望 forward 是一条顺畅的、确定的算子链条。
+    当 fx 遇到 if 语句时，它必须立刻决定走 True 分支还是 False 分支。
+
+    冲突点：由于 x 是一个符号化的 Proxy 对象，它的 numel() 结果也是一个 Proxy。
+    Python 解释器在执行 if <Proxy> 时，无法得知这个 Tensor 在未来运行阶段到底是空还是满，因此报错。
     """
+
     import mmcv.cnn.bricks.wrappers as w
 
     saved = {}
@@ -163,6 +175,9 @@ def apply_selective_ptq(model, backend_type, logger):
     对模型中适合量化的子模块逐一调用 prepare_by_platform，
     跳过 vtransform / voxelize / sparse-backbone 等不适合量化的部分。
 
+    该函数的核心思想是“选择性量化”：只对标准密集算子分支做 FX 插桩，
+    并用日志记录成功/失败/跳过的子模块，确保流程可控、可回溯。
+
     Args:
         model (nn.Module): 原始浮点模型
         backend_type (BackendType): 目标后端（TensorRT）
@@ -174,6 +189,7 @@ def apply_selective_ptq(model, backend_type, logger):
     success, failed, skipped = [], [], []
 
     # --- 固定路径的子模块 ---
+    # 逐个按路径获取子模块，使用 patch_mmcv_for_fx 保护 FX 追踪
     for attr_key, display_name in _QUANTIZABLE_SUBMODULE_KEYS:
         try:
             submodule = _get_nested_attr(model, attr_key)
@@ -183,16 +199,20 @@ def apply_selective_ptq(model, backend_type, logger):
             continue
 
         try:
+            # 关键点：临时修补 mmcv wrapper，避免 FX 因 if x.numel()==0 报错
             with patch_mmcv_for_fx():
                 quantized = prepare_by_platform(submodule, backend_type)
+            # 将量化后的子模块写回模型
             _set_nested_attr(model, attr_key, quantized)
             success.append(display_name)
             logger.info(f"  ✓ 量化子模块: {display_name}")
         except Exception as e:
+            # 量化失败则记录并跳过，保证整体流程不中断
             failed.append(display_name)
             logger.warning(f"  ✗ 量化子模块 {display_name} 失败（已跳过）: {e}")
 
     # --- heads（数量可变）---
+    # heads 是 ModuleDict，名称不固定，因此逐项遍历量化
     if hasattr(model, "heads"):
         for head_name, head_module in model.heads.items():
             display_name = f"heads/{head_name}"
@@ -247,25 +267,29 @@ def run_calibration(model, data_loader, num_batches, logger):
     """
     logger.info(f"开始 MinMax 校准，共使用 {num_batches} 个 batch ...")
 
-    # 启用 Observer（记录 min/max），禁用 FakeQuant
+    # 启用 Observer（记录 min/max），禁用 FakeQuant，进入“收集统计量”模式
     enable_calibration(model)
     model.eval()
 
     with torch.no_grad():
         for i, data in enumerate(data_loader):
             if i >= num_batches:
+                # 达到指定校准 batch 数后退出
                 break
             try:
+                # 前向推理：仅用于统计激活分布，不计算梯度
                 model(return_loss=False, rescale=True, **data)
             except Exception as e:
+                # 单个 batch 失败时跳过，避免影响整体校准
                 logger.warning(f"  校准 batch {i} 出错（已跳过）: {e}")
                 continue
             if (i + 1) % 10 == 0:
+                # 定期打印进度，便于监控校准进展
                 logger.info(f"  校准进度: {i + 1}/{num_batches}")
 
     logger.info("MinMax 校准完成，scale/zero_point 已确定。")
 
-    # 冻结 Observer，激活 FakeQuant → 量化推理模式
+    # 冻结 Observer 的统计量，启用 FakeQuant，切换到量化推理模式
     enable_quantization(model)
     logger.info("模型已切换为量化推理模式（FakeQuant 激活）。")
 
