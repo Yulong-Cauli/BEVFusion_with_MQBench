@@ -32,6 +32,7 @@ set -e
 WORK_DIR="/media/yellowstone/data2/CYL/BEVFusion_with_MQBench"
 CONDA_ENV="bevfusion_mqbench"
 GPU_ID=0  # RTX 3090 24GB (GPU#2 A100 不能训练)
+NUM_GPUS=1  # 单GPU训练。设 2/3/4 可多卡并行(需 torchpack)
 BATCH_SIZE=4
 WORKERS=8
 MAX_EPOCHS=6
@@ -124,7 +125,25 @@ setup_environment() {
         pip install mqbench==0.0.6 2>/dev/null || log_warn "MQBench 跳过 (训练不需要)"
     fi
 
-    pip install -e . --quiet
+    # CUDA toolkit 处理 (编译自定义 CUDA 算子需要 nvcc)
+    # 服务器 CUDA driver 12.2 向下兼容 cu113，但编译需要匹配的 toolkit
+    log_info "检查 CUDA toolkit..."
+    if [ -d "/usr/local/cuda-11.3" ]; then
+        export CUDA_HOME=/usr/local/cuda-11.3
+    elif [ -d "/usr/local/cuda-11.6" ]; then
+        export CUDA_HOME=/usr/local/cuda-11.6
+    elif [ -d "/usr/local/cuda-11.8" ]; then
+        export CUDA_HOME=/usr/local/cuda-11.8
+    elif [ -d "/usr/local/cuda" ]; then
+        export CUDA_HOME=/usr/local/cuda
+    fi
+    if [ -n "$CUDA_HOME" ]; then
+        log_info "CUDA_HOME=$CUDA_HOME"
+        export PATH="$CUDA_HOME/bin:$PATH"
+    fi
+
+    log_info "编译安装 mmdet3d (含 CUDA 算子)..."
+    pip install -e . 2>&1 | tail -5
     
     log_info "验证..."
     CUDA_VISIBLE_DEVICES=$GPU_ID python -c "
@@ -191,15 +210,33 @@ start_training() {
         NO_VAL="--no-validate"
         log_warn "无 sweeps，跳过验证"; }
 
-    log_info "GPU $GPU_ID (RTX 3090), batch=$BATCH_SIZE, epochs=$MAX_EPOCHS"
+    log_info "GPU: $NUM_GPUS x RTX 3090, batch=$BATCH_SIZE/gpu, epochs=$MAX_EPOCHS"
     mkdir -p "$RUN_DIR"
 
-    # nohup 后台运行，断开 SSH 也不会停
-    CUDA_VISIBLE_DEVICES=$GPU_ID nohup python tools/train.py \
-        "$CONFIG" --run-dir "$RUN_DIR" $NO_VAL \
-        data.samples_per_gpu=$BATCH_SIZE data.workers_per_gpu=$WORKERS \
-        max_epochs=$MAX_EPOCHS $RESUME_FLAG \
-        > "$RUN_DIR/train.log" 2>&1 &
+    # 设置 CUDA_HOME (编译算子时已设置，训练时也保持)
+    for cuda_dir in /usr/local/cuda-11.3 /usr/local/cuda-11.6 /usr/local/cuda-11.8 /usr/local/cuda; do
+        [ -d "$cuda_dir" ] && { export CUDA_HOME="$cuda_dir"; break; }
+    done
+
+    if [ "$NUM_GPUS" -gt 1 ]; then
+        # 多GPU: 使用 torchpack 分布式训练
+        # GPU 0,1,3,4 是 RTX 3090 (跳过 GPU#2 A100)
+        GPU_LIST=$(seq 0 $((NUM_GPUS > 4 ? 3 : NUM_GPUS - 1)) | grep -v 2 | head -$NUM_GPUS | tr '\n' ',' | sed 's/,$//')
+        log_info "多GPU模式: CUDA_VISIBLE_DEVICES=$GPU_LIST, np=$NUM_GPUS"
+        CUDA_VISIBLE_DEVICES=$GPU_LIST nohup torchpack dist-run -np $NUM_GPUS \
+            python tools/train.py \
+            "$CONFIG" --run-dir "$RUN_DIR" $NO_VAL \
+            data.samples_per_gpu=$BATCH_SIZE data.workers_per_gpu=$WORKERS \
+            max_epochs=$MAX_EPOCHS $RESUME_FLAG \
+            > "$RUN_DIR/train.log" 2>&1 &
+    else
+        # 单GPU
+        CUDA_VISIBLE_DEVICES=$GPU_ID nohup python tools/train.py \
+            "$CONFIG" --run-dir "$RUN_DIR" $NO_VAL \
+            data.samples_per_gpu=$BATCH_SIZE data.workers_per_gpu=$WORKERS \
+            max_epochs=$MAX_EPOCHS $RESUME_FLAG \
+            > "$RUN_DIR/train.log" 2>&1 &
+    fi
 
     PID=$!; echo "$PID" > "$RUN_DIR/train.pid"
 
