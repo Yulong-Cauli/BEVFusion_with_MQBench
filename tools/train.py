@@ -38,6 +38,8 @@ def main():
     parser.add_argument("config", metavar="FILE", help="config file")
     # 可选参数：运行输出目录
     parser.add_argument("--run-dir", metavar="DIR", help="run directory")
+    parser.add_argument("--no-validate", action="store_true",
+                        help="skip validation during training (useful when sweeps data unavailable)")
     # args: 主要参数，opts: 其他选项（如学习率等）
     args, opts = parser.parse_known_args()
 
@@ -114,29 +116,6 @@ def main():
     # 根据配置文件构建训练数据集
     # cfg.data.train 包含数据集类型、路径、数据处理管道等信息
     datasets = [build_dataset(cfg.data.train)]
-    
-    # ========== 【断点1】数据集检查 ==========
-    # 在这里放断点来检查数据集的基本信息
-    dataset = datasets[0]
-    # 在IDE中添加以下调试代码（可选）：
-    # - 查看 dataset.data_infos 的长度（数据集大小）
-    # - 查看 dataset.CLASSES 类别列表
-    print(f"DEBUG: Dataset size: {len(dataset)}")
-    print(f"DEBUG: Dataset classes: {dataset.CLASSES}")
-    if len(dataset) > 0:
-        # 获取第一个样本查看数据结构
-        sample_idx = 0
-        sample_data = dataset[sample_idx]
-        print(f"DEBUG: First sample keys: {sample_data.keys()}")
-        for key in sample_data.keys():
-            if isinstance(sample_data[key], torch.Tensor):
-                print(f"  {key}: shape={sample_data[key].shape}, dtype={sample_data[key].dtype}")
-            elif isinstance(sample_data[key], dict):
-                print(f"  {key}: dict with keys {sample_data[key].keys()}")
-            elif isinstance(sample_data[key], list):
-                print(f"  {key}: list with {len(sample_data[key])} items")
-            else:
-                print(f"  {key}: {type(sample_data[key])}")
 
     # ========== 模型构建 ==========
     # 根据配置文件构建模型
@@ -166,7 +145,7 @@ def main():
         datasets,  # 训练数据集列表
         cfg,  # 配置对象
         distributed=distributed,  # 启用分布式训练
-        validate=True,  # 每个epoch进行验证
+        validate=not args.no_validate,  # 每个epoch进行验证（除非指定 --no-validate）
         timestamp=timestamp,  # 时间戳（用于标记实验）
     )
 
