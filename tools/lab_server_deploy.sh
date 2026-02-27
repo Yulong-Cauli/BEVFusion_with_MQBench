@@ -108,6 +108,7 @@ setup_environment() {
         conda activate "$CONDA_ENV"
 
         log_info "安装 PyTorch 1.10.2+cu113..."
+        pip install "setuptools<65"  # PyTorch 1.10 需要旧版 setuptools (pkg_resources.packaging)
         pip install torch==1.10.2+cu113 torchvision==0.11.3+cu113 \
             -f https://download.pytorch.org/whl/cu113/torch_stable.html
 
