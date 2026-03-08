@@ -46,6 +46,7 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mmcv import Config
 from torchpack import distributed as dist
 from torchpack.environ import auto_set_run_dir, set_run_dir
@@ -61,6 +62,9 @@ from mmdet3d.utils import get_root_logger, convert_sync_batchnorm, recursive_eva
 try:
     from mqbench.prepare_by_platform import prepare_by_platform, BackendType
     from mqbench.utils.state import enable_calibration, enable_quantization
+    from mqbench.fake_quantize import LearnableFakeQuantize
+    from mqbench.observer import MinMaxObserver, EMAMinMaxObserver
+    from mqbench.scheme import QuantizeScheme
 except ImportError:
     warnings.warn(
         "MQBench is not installed. Please install it via: "
@@ -113,6 +117,106 @@ def patch_mmcv_for_fx():
 
 
 # ============================================================================
+# 手动量化：为无法 torch.fx 追踪的模块（SwinT、TransFusionHead 等）提供回退
+# ============================================================================
+
+def _create_tensorrt_fakeq_pair():
+    """创建一对 (weight_fq, act_fq)，匹配 MQBench TensorRT INT8 配置。"""
+    w_params = QuantizeScheme(
+        symmetry=True, per_channel=True, pot_scale=False,
+        bit=8, symmetric_range=True
+    ).to_observer_params()
+    a_params = QuantizeScheme(
+        symmetry=True, per_channel=False, pot_scale=False,
+        bit=8, symmetric_range=True
+    ).to_observer_params()
+    weight_fq = LearnableFakeQuantize(observer=MinMaxObserver, **w_params)
+    act_fq = LearnableFakeQuantize(observer=EMAMinMaxObserver, **a_params)
+    return weight_fq, act_fq
+
+
+class _QuantizedConv2d(nn.Module):
+    """Conv2d + MQBench FakeQuantize（适用于无法 fx 追踪的模块）。"""
+
+    def __init__(self, original):
+        super().__init__()
+        self.conv = original
+        self.weight_fake_quant, self.act_fake_quant = _create_tensorrt_fakeq_pair()
+
+    # 代理常用属性，确保外部代码直接访问 .weight / .bias 等不会出错
+    @property
+    def weight(self):
+        return self.conv.weight
+
+    @property
+    def bias(self):
+        return self.conv.bias
+
+    def forward(self, x):
+        x = self.act_fake_quant(x)
+        weight = self.weight_fake_quant(self.conv.weight)
+        return F.conv2d(
+            x, weight, self.conv.bias,
+            self.conv.stride, self.conv.padding,
+            self.conv.dilation, self.conv.groups,
+        )
+
+
+class _QuantizedLinear(nn.Module):
+    """Linear + MQBench FakeQuantize（适用于无法 fx 追踪的模块）。"""
+
+    def __init__(self, original):
+        super().__init__()
+        self.linear = original
+        self.weight_fake_quant, self.act_fake_quant = _create_tensorrt_fakeq_pair()
+
+    @property
+    def weight(self):
+        return self.linear.weight
+
+    @property
+    def bias(self):
+        return self.linear.bias
+
+    @property
+    def in_features(self):
+        return self.linear.in_features
+
+    @property
+    def out_features(self):
+        return self.linear.out_features
+
+    def forward(self, x):
+        x = self.act_fake_quant(x)
+        weight = self.weight_fake_quant(self.linear.weight)
+        return F.linear(x, weight, self.linear.bias)
+
+
+def manual_quantize_nontraceable(module, logger, module_name="unknown"):
+    """对无法 torch.fx 追踪的模块手动插入 FakeQuantize 节点。
+
+    逐层替换 Conv2d/Linear 为带有 FakeQuantize 的包装版本。
+    与 MQBench enable_calibration / enable_quantization 完全兼容。
+    """
+    replacements = []
+    for name, child in list(module.named_modules()):
+        if isinstance(child, nn.Conv2d) and not isinstance(child, _QuantizedConv2d):
+            replacements.append((name, _QuantizedConv2d(child)))
+        elif isinstance(child, nn.Linear) and not isinstance(child, _QuantizedLinear):
+            replacements.append((name, _QuantizedLinear(child)))
+
+    for name, replacement in replacements:
+        _set_nested_attr(module, name, replacement)
+
+    fq_count = len(replacements) * 2
+    logger.info(
+        f"  ↪ 手动量化 {module_name}: 替换 {len(replacements)} 个 Conv2d/Linear，"
+        f"插入 {fq_count} 个 FakeQuant 节点"
+    )
+    return module
+
+
+# ============================================================================
 # 选择性量化：只量化适合量化的子模块
 # ============================================================================
 
@@ -146,26 +250,32 @@ _QUANTIZABLE_SUBMODULE_KEYS = [
 
 
 def _get_nested_attr(obj, key: str):
-    """支持 'a.b.c' 形式的嵌套属性访问（含 nn.ModuleDict）。"""
+    """支持 'a.b.c' 形式的嵌套属性访问（含 ModuleDict/ModuleList/Sequential）。"""
     for part in key.split("."):
         if isinstance(obj, nn.ModuleDict):
             obj = obj[part]
+        elif isinstance(obj, (nn.ModuleList, nn.Sequential)) and part.isdigit():
+            obj = obj[int(part)]
         else:
             obj = getattr(obj, part)
     return obj
 
 
 def _set_nested_attr(obj, key: str, value):
-    """支持 'a.b.c' 形式的嵌套属性设置（含 nn.ModuleDict）。"""
+    """支持 'a.b.c' 形式的嵌套属性设置（含 ModuleDict/ModuleList/Sequential）。"""
     parts = key.split(".")
     for part in parts[:-1]:
         if isinstance(obj, nn.ModuleDict):
             obj = obj[part]
+        elif isinstance(obj, (nn.ModuleList, nn.Sequential)) and part.isdigit():
+            obj = obj[int(part)]
         else:
             obj = getattr(obj, part)
     last = parts[-1]
     if isinstance(obj, nn.ModuleDict):
         obj[last] = value
+    elif isinstance(obj, (nn.ModuleList, nn.Sequential)) and last.isdigit():
+        obj[int(last)] = value
     else:
         setattr(obj, last, value)
 
@@ -205,11 +315,19 @@ def apply_selective_ptq(model, backend_type, logger):
             # 将量化后的子模块写回模型
             _set_nested_attr(model, attr_key, quantized)
             success.append(display_name)
-            logger.info(f"  ✓ 量化子模块: {display_name}")
+            logger.info(f"  ✓ 量化子模块: {display_name} (fx)")
         except Exception as e:
-            # 量化失败则记录并跳过，保证整体流程不中断
-            failed.append(display_name)
-            logger.warning(f"  ✗ 量化子模块 {display_name} 失败（已跳过）: {e}")
+            # torch.fx 追踪失败，回退到手动量化（逐层包装 Conv2d/Linear）
+            logger.warning(
+                f"  ✗ {display_name} torch.fx 追踪失败: "
+                f"{type(e).__name__}: {str(e)[:80]}"
+            )
+            try:
+                manual_quantize_nontraceable(submodule, logger, display_name)
+                success.append(f"{display_name} (手动)")
+            except Exception as e2:
+                failed.append(display_name)
+                logger.warning(f"  ✗ {display_name} 手动量化也失败: {e2}")
 
     # --- heads（数量可变）---
     # heads 是 ModuleDict，名称不固定，因此逐项遍历量化
@@ -221,10 +339,18 @@ def apply_selective_ptq(model, backend_type, logger):
                     quantized_head = prepare_by_platform(head_module, backend_type)
                 model.heads[head_name] = quantized_head
                 success.append(display_name)
-                logger.info(f"  ✓ 量化子模块: {display_name}")
+                logger.info(f"  ✓ 量化子模块: {display_name} (fx)")
             except Exception as e:
-                failed.append(display_name)
-                logger.warning(f"  ✗ 量化子模块 {display_name} 失败（已跳过）: {e}")
+                logger.warning(
+                    f"  ✗ {display_name} torch.fx 追踪失败: "
+                    f"{type(e).__name__}: {str(e)[:80]}"
+                )
+                try:
+                    manual_quantize_nontraceable(head_module, logger, display_name)
+                    success.append(f"{display_name} (手动)")
+                except Exception as e2:
+                    failed.append(display_name)
+                    logger.warning(f"  ✗ {display_name} 手动量化也失败: {e2}")
 
     logger.info(
         f"选择性量化完成: 成功 {len(success)} 个, "
@@ -550,17 +676,19 @@ def diagnose_quantization_effect(model, data_loader, logger, num_samples=5):
         logger.info("  ✅ 所有已量化模块的 FakeQuant 节点均正常工作")
         logger.info("  ✅ INT8 输出与 FP32 存在可测量差异，量化已正确生效")
         logger.info("")
-        logger.info("  💡 FP32 ≈ INT8 (NDS 几乎无差异) 的原因:")
-        logger.info(
-            f"     仅 {q_pct:.1f}% 的参数被量化，"
-            f"{u_pct:.1f}% 的模型仍为 FP32。"
-        )
-        logger.info(
-            "     最大的未量化模块 (camera/backbone SwinT) 占总参数 ~67%。"
-        )
-        logger.info("     量化覆盖率低 → 对端到端 NDS 影响自然很小。")
-        logger.info("")
-        logger.info("  📊 要获得更显著的量化效果，需要量化 SwinT backbone。")
+        if q_pct >= 80:
+            logger.info(f"  📊 量化覆盖率 {q_pct:.1f}%（{u_pct:.1f}% 仍为 FP32）")
+            logger.info("     覆盖率已较高，NDS 下降主要取决于各模块的量化敏感度。")
+            logger.info("     未量化部分：camera/vtransform (bev_pool CUDA) + lidar/backbone (spconv)")
+        else:
+            logger.info("  💡 FP32 ≈ INT8 (NDS 几乎无差异) 的原因:")
+            logger.info(
+                f"     仅 {q_pct:.1f}% 的参数被量化，"
+                f"{u_pct:.1f}% 的模型仍为 FP32。"
+            )
+            logger.info("     量化覆盖率低 → 对端到端 NDS 影响自然很小。")
+            logger.info("")
+            logger.info("  📊 要获得更显著的量化效果，需要量化更多模块。")
     else:
         logger.error("  ⚠️ 部分模块的 FakeQuant 可能未正确工作！")
         logger.error(
