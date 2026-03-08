@@ -127,15 +127,17 @@ def patch_mmcv_for_fx():
 # ============================================================================
 
 def _create_tensorrt_fakeq_pair():
-    """创建一对 (weight_fq, act_fq)，匹配 MQBench TensorRT INT8 配置。"""
+    """创建一对 (weight_fq, act_fq)，匹配 MQBench TensorRT INT8 配置。
+    兼容不同版本 MQBench（不依赖 symmetric_range kwarg）。
+    """
     w_params = QuantizeScheme(
-        symmetry=True, per_channel=True, pot_scale=False,
-        bit=8, symmetric_range=True
+        symmetry=True, per_channel=True, pot_scale=False, bit=8
     ).to_observer_params()
+    w_params['quant_min'] = -127  # TensorRT 标准对称范围 [-127, 127]
     a_params = QuantizeScheme(
-        symmetry=True, per_channel=False, pot_scale=False,
-        bit=8, symmetric_range=True
+        symmetry=True, per_channel=False, pot_scale=False, bit=8
     ).to_observer_params()
+    a_params['quant_min'] = -127
     weight_fq = LearnableFakeQuantize(observer=MinMaxObserver, **w_params)
     act_fq = LearnableFakeQuantize(observer=EMAMinMaxObserver, **a_params)
     return weight_fq, act_fq
@@ -228,20 +230,18 @@ def manual_quantize_nontraceable(module, logger, module_name="unknown"):
 
 def _create_spconv_fakeq_pair():
     """创建 per-channel 量化的 FakeQuant 对，适用于稀疏卷积。
-
-    稀疏卷积权重形状为 [K,K,K,C_in,C_out]，与标准 Conv2d [C_out,C_in,K,K] 不同，
-    per-channel 的 ch_axis 需要设为 4（输出通道维度）。
+    兼容不同版本 MQBench（不依赖 symmetric_range kwarg）。
+    稀疏卷积权重形状为 [K,K,K,C_in,C_out]，ch_axis=4（输出通道维度）。
     """
     w_params = QuantizeScheme(
-        symmetry=True, per_channel=True, pot_scale=False,
-        bit=8, symmetric_range=True
+        symmetry=True, per_channel=True, pot_scale=False, bit=8
     ).to_observer_params()
-    # 稀疏卷积权重输出通道在最后一维 (axis=4)
+    w_params['quant_min'] = -127
     w_params['ch_axis'] = 4
     a_params = QuantizeScheme(
-        symmetry=True, per_channel=False, pot_scale=False,
-        bit=8, symmetric_range=True
+        symmetry=True, per_channel=False, pot_scale=False, bit=8
     ).to_observer_params()
+    a_params['quant_min'] = -127
     weight_fq = LearnableFakeQuantize(observer=MinMaxObserver, **w_params)
     act_fq = LearnableFakeQuantize(observer=EMAMinMaxObserver, **a_params)
     return weight_fq, act_fq
