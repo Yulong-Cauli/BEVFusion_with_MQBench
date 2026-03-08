@@ -1,6 +1,6 @@
-# BEVFusion + MQBench 量化工具集
+# BEVFusion + MQBench 全模型量化工具集
 
-> 本项目在 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion)（基于 mmdetection3d）的基础上，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具，实现了面向 TensorRT INT8 后端的**训练后量化（PTQ）**与**混合精度 TensorRT 部署**。
+> 本项目在 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion)（基于 mmdetection3d）的基础上，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具，通过**三路径量化策略**实现了 BEVFusion 全部 **8/8 子模块的 INT8 训练后量化（PTQ）**，覆盖 100% 可学习参数。
 
 ---
 
@@ -12,7 +12,7 @@
 - [数据准备](#数据准备)
 - [预训练模型](#预训练模型)
 - [PTQ：训练后量化](#ptq训练后量化)
-- [TensorRT 部署](#tensorrt-部署)
+- [TensorRT 部署（Legacy）](#tensorrt-部署legacy)
 - [Benchmark 工具](#benchmark-工具)
 - [文档索引](#文档索引)
 - [致谢](#致谢)
@@ -23,42 +23,36 @@
 
 本项目以 [MIT BEVFusion](https://github.com/mit-han-lab/bevfusion) 为基础，集成了 [MQBench](https://github.com/ModelTC/MQBench) 量化工具库，实现了：
 
-1. **选择性 PTQ**：对 4/6 个可量化子模块进行 MinMax 训练后量化，精度零损失
-2. **全模块 TRT 部署**：将 4 个已量化模块全部导出为 TensorRT 引擎（占全模型参数 17%，FP32 权重 26.5 MB → INT8 引擎 7.2 MB）
-3. **Hybrid 推理**：TRT 引擎与 PyTorch 混合执行，端到端 NDS 评估验证通过
+1. **全模型 INT8 PTQ（8/8 模块）**：通过三路径量化策略，对 BEVFusion 全部 8 个子模块进行 MinMax 训练后量化，覆盖 100% 可学习参数（40.9M）
+2. **三路径量化策略**：针对 torch.fx 不兼容的模块，提出手动 FakeQuant 包装方案（Conv2d/Linear 包装 + SparseConv 包装），与 torch.fx 自动插桩互补
+3. **逐模块消融分析**：`--skip-modules` / `--diagnose` CLI 支持，可定位各模块对量化精度的影响
+4. **TRT Hybrid 部署**（Legacy）：4 个 fx 兼容模块可导出 TRT 引擎做混合推理
 
 | 脚本 | 功能 |
 |------|------|
 | `tools/test.py` | **FP32 评估** — 基准精度测试 |
 | `tools/train.py` | **训练** — 分布式训练（torchrun） |
-| `tools/quant_ptq_minmax.py` | **PTQ** — MinMax 校准 + 精度评估 |
+| `tools/quant_ptq_minmax.py` | **PTQ** — 三路径 MinMax 校准 + 精度评估 + 消融分析 |
 | `tools/quant_benchmark.py` | **Benchmark** — 模型大小与推理延迟测量 |
-| `tools/trt_eval_hybrid_all.py` | **TRT 全模块评估** — 4/5 模块 TRT 导出 + Hybrid 端到端 NDS 评估 |
+| `tools/trt_eval_hybrid_all.py` | **TRT Hybrid 评估** — 4 模块 TRT 导出 + Hybrid 端到端 NDS 评估 |
 
-目标后端：**NVIDIA TensorRT INT8**
+目标后端：**NVIDIA TensorRT INT8**（MQBench FakeQuant 仿真结果即为量化精度）
 
 ---
 
 ## 核心成果
 
-### PTQ 精度（MQBench FakeQuant 仿真，4/6 模块量化）
+### 全模型 INT8 PTQ 消融实验（MQBench FakeQuant 仿真，nuScenes mini 81 帧）
 
-| 指标 | FP32 基线 | PTQ 4/6 (MinMax) | 变化 |
-|------|----------|------------------|------|
-| **NDS** | 0.5801 | **0.5810** | **+0.0009**（无损） |
-| **mAP** | 0.5742 | **0.5759** | **+0.0017**（无损） |
+| 量化配置 | NDS | mAP | ΔNDS | 参数覆盖率 |
+|----------|-----|-----|------|-----------|
+| FP32 基线 | 0.5801 | 0.5747 | — | 0% |
+| INT8 6/8（fx auto + SwinT 手动 + Head 手动） | 0.5799 | 0.5766 | −0.0002 | 87% |
+| INT8 7/8（+vtransform 手动） | 0.5485 | — | −0.0316 | 93.5% |
+| INT8 7/8（+lidar/backbone 手动） | 0.4803 | — | −0.0998 | 93.6% |
+| **INT8 8/8（全模型）** | **0.4276** | **0.3667** | **−0.1525** | **100%** |
 
-### TRT Hybrid 端到端评估（4 模块替换为 TRT 引擎）
-
-| 精度 | NDS | mAP | NDS 变化 | 4 模块引擎大小 | 模块压缩比 |
-|------|-----|-----|---------|-------------|-----------|
-| PyTorch FP32（基线） | 0.5800 | 0.5744 | — | — | — |
-| **TRT FP32** | **0.5800** | **0.5744** | **+0.0000** | 42.6 MB | — |
-| **TRT FP16** | **0.5795** | **0.5743** | **−0.0005** | 13.5 MB | **1.96x** |
-| **TRT INT8** | **0.5723** | **0.5652** | **−0.0077** | 7.2 MB | **3.68x** |
-
-> 4 个 TRT 模块的 FP32 权重合计 26.5 MB（占全模型 155.9 MB 的 17%）。压缩比相对于这 26.5 MB 计算。
-> 未量化模块（SwinTransformer 67.5%、SpConv 等）仍以 PyTorch FP32 运行，权重约 129.4 MB。
+> 消融分析表明：camera/vtransform 和 lidar/backbone 是主要精度敏感模块。6/8 量化配置可实现近乎零损失的 INT8 量化。
 
 ---
 
@@ -159,46 +153,58 @@ python tools/create_data.py nuscenes --root-path ./data/nuscenes \
 
 **脚本**：`tools/quant_ptq_minmax.py`
 
-### 原理
+### 核心原理：三路径量化策略
 
-PTQ 无需重新训练，仅需少量校准数据即可确定量化参数。本项目采用 **MinMax 校准**策略：
+BEVFusion 包含稀疏卷积、自定义 CUDA 算子和动态控制流，无法对全模型直接使用 `torch.fx` 追踪。本项目提出**三路径量化策略**，根据各模块的特性选择不同的 FakeQuant 插入方式，实现 8/8 模块全覆盖：
 
-1. 对可量化子模块逐一调用 `prepare_by_platform`，插入 FakeQuantize 节点
-2. `enable_calibration`：在校准数据上前向推理，记录各层激活值的 min/max
-3. `enable_quantization`：冻结 Observer，激活 FakeQuant，进入量化推理模式
+#### 路径 ①：torch.fx 自动插桩（`prepare_by_platform`）
 
-### 选择性量化策略
+适用于纯标准密集卷积、与符号追踪兼容的模块。MQBench 的 `prepare_by_platform` 通过 `torch.fx.symbolic_trace` 自动在计算图中插入 FakeQuantize 节点。
 
-BEVFusion 包含自定义 CUDA 算子和动态控制流，不能对全模型直接量化，因此采用**选择性量化**：
+```
+子模块 → torch.fx.symbolic_trace → FakeQuant 自动插入 → 量化仿真模型
+```
 
-**✅ 已成功量化（4/6）**：
+**适用模块**：camera/neck、fuser、decoder/backbone、decoder/neck
 
-| 子模块 | 类型 | 说明 |
-|--------|------|------|
-| `decoder.backbone` | SECOND | 纯静态 Conv2d，fx 直接可追踪 |
-| `decoder.neck` | SECONDFPN | 已修复 `len()` 断言 + mmcv 包装层 |
-| `encoders.camera.neck` | GeneralizedLSSFPN | 已修复 `len()` 调用 + mmcv 包装层 |
-| `fuser` | ConvFuser | 已修复 `torch.cat(Proxy)` 问题 |
+#### 路径 ②：手动 FakeQuant 包装 Conv2d/Linear（`manual_quantize_nontraceable`）
 
-**❌ 暂不支持（2/6）**：
+适用于 torch.fx 追踪失败（动态控制流、自定义 CUDA 算子等），但内部仍为标准 `nn.Conv2d` / `nn.Linear` 层的模块。遍历模块树，将每个 Conv2d 替换为 `_QuantizedConv2d`、每个 Linear 替换为 `_QuantizedLinear`，各自包含权重 FakeQuant 和激活 FakeQuant。
 
-| 子模块 | 类型 | 失败原因 |
-|--------|------|----------|
-| `encoders.camera.backbone` | SwinTransformer | 含 `if tensor_value:` 动态控制流 |
-| `heads.object` | TransFusionHead | Proxy 对象被 for 循环迭代 |
+```
+子模块 → 遍历所有 Conv2d/Linear → 替换为 _QuantizedConv2d/_QuantizedLinear → 量化仿真模型
+```
 
-**⊘ 设计跳过**（非标准卷积，不适合 PTQ）：
+**适用模块**：camera/backbone（SwinTransformer）、camera/vtransform（DepthLSSTransform）、heads/object（TransFusionHead）
 
-| 子模块 | 跳过原因 |
-|--------|----------|
-| `encoders.camera.vtransform` | 内含 `bev_pool`（QuickCumsumCuda）自定义 CUDA 算子 |
-| `encoders.lidar.voxelize` | 点云体素化预处理，非神经网络层 |
-| `encoders.lidar.backbone` | 稀疏卷积（SparseEncoder），FakeQuant 节点无法插入 |
+#### 路径 ③：手动 FakeQuant 包装 SparseConvolution（`manual_quantize_sparse`）
+
+适用于 LiDAR backbone 的稀疏卷积层（spconv v1.x）。将每个 `SparseConvolution` 替换为 `_QuantizedSparseConv`（继承 `SparseModule`），对 features 张量 `[N,C]` 直接做激活量化，对 weight `[K,K,K,C_in,C_out]` 做 per-channel 量化（`ch_axis=4`）。
+
+```
+子模块 → 遍历所有 SparseConvolution → 替换为 _QuantizedSparseConv → 量化仿真模型
+```
+
+**适用模块**：lidar/backbone（SparseEncoder）
+
+### 全模型量化模块一览（8/8）
+
+| 模块 | 参数量 | 占比 | 量化路径 | torch.fx 失败原因 |
+|------|--------|------|---------|------------------|
+| camera/backbone（SwinT） | 27.6M | 67.5% | ② 手动 Conv2d/Linear | AdaptivePadding 动态控制流 |
+| camera/neck（LSSFPN） | 1.6M | 3.9% | ① torch.fx 自动 | — |
+| camera/vtransform（DepthLSSTransform） | 2.6M | 6.4% | ② 手动 Conv2d | bev_pool CUDA kernel |
+| lidar/backbone（SparseEncoder） | 2.7M | 6.6% | ③ 手动 SparseConv | spconv 非 fx 兼容 |
+| fuser（ConvFuser） | 0.8M | 1.9% | ① torch.fx 自动 | — |
+| decoder/backbone（SECOND） | 4.3M | 10.5% | ① torch.fx 自动 | — |
+| decoder/neck（SECONDFPN） | 0.3M | 0.7% | ① torch.fx 自动 | — |
+| heads/object（TransFusionHead） | 1.0M | 2.5% | ② 手动 Conv2d/Linear | ModuleList 中 Proxy 迭代 |
+| **合计** | **40.9M** | **100%** | | |
 
 ### 使用方法
 
 ```bash
-# 校准 + 精度评估（推荐，约 3 分钟）
+# 全模型 INT8 PTQ（8/8 模块，推荐）
 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load_from pretrained/bevfusion-det.pth
@@ -209,6 +215,18 @@ python tools/quant_ptq_minmax.py \
     --load_from pretrained/bevfusion-det.pth \
     --calib-batches 256
 
+# 消融实验：跳过指定模块
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --skip-modules camera/vtransform lidar/backbone
+
+# 诊断模式：逐模块余弦相似度分析
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --diagnose
+
 # 仅校准并保存（跳过精度评估）
 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
@@ -216,36 +234,40 @@ python tools/quant_ptq_minmax.py \
     --no-eval
 ```
 
-> ⚠️ PTQ checkpoint 的 `state_dict` 键名经 `torch.fx` 改造，**不能**用 `tools/test.py` 直接评估。精度评估请通过本脚本（不加 `--no-eval`）完成。
+> ⚠️ PTQ checkpoint 的 `state_dict` 键名经 `torch.fx` 改造（路径 ① 的模块），**不能**用 `tools/test.py` 直接评估。精度评估请通过本脚本（不加 `--no-eval`）完成。
 
-### 输出
-
-量化模型保存至 `runs/<run_dir>/ptq_minmax_model.pth`，包含量化后的权重与 scale/zero_point 参数。
+### CLI 参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--calib-batches` | 128 | 校准 batch 数量，32~512 通常足够 |
 | `--no-eval` | False | 是否跳过量化后的精度评估 |
+| `--skip-modules` | 无 | 消融实验：跳过指定模块的量化（空格分隔模块名） |
+| `--diagnose` | False | 诊断模式：输出逐模块 INT8 余弦相似度分析 |
 | `--run-dir` | 自动生成 | 输出目录 |
 
----
+### 输出
 
-## 量化精度验证结果
+量化模型保存至 `runs/<run_dir>/ptq_minmax_model.pth`，包含量化后的权重与 scale/zero_point 参数。
 
-在 nuScenes v1.0-mini 验证集（81 样本）上，使用 128 batch 校准的完整 NDS 评估：
+### 消融实验结果
 
-| 指标 | FP32 基线 | PTQ 4/6（MinMax） | 变化 |
-|------|----------|------------------|------|
-| **NDS** | 0.5801 | **0.5810** | **+0.0009**（无损） |
-| **mAP** | 0.5742 | **0.5759** | **+0.0017**（无损） |
+| 量化配置 | NDS | mAP | ΔNDS | 参数覆盖率 |
+|----------|-----|-----|------|-----------|
+| FP32 基线 | 0.5801 | 0.5747 | — | 0% |
+| INT8 6/8（fx auto + SwinT + Head） | 0.5799 | 0.5766 | −0.0002 | 87% |
+| INT8 7/8（+vtransform） | 0.5485 | — | −0.0316 | 93.5% |
+| INT8 7/8（+lidar/backbone） | 0.4803 | — | −0.0998 | 93.6% |
+| INT8 8/8（全模型） | 0.4276 | 0.3667 | −0.1525 | 100% |
 
-> ✅ 最朴素的 MinMax PTQ 在 4/6 模块量化后实现了**零精度损失**。
+> ✅ 6/8 模块量化（覆盖 87% 参数）可实现近乎零损失的 INT8 量化（ΔNDS = −0.0002）。
+> ⚠️ camera/vtransform 和 lidar/backbone 为主要精度敏感模块，全模型量化时精度下降显著。
 
 <details>
-<summary>逐类 AP 详情</summary>
+<summary>逐类 AP 详情（FP32 vs INT8 6/8）</summary>
 
-| 类别 | FP32 | PTQ 4/6 | 变化 |
-|------|------|---------|------|
+| 类别 | FP32 | INT8 6/8 | 变化 |
+|------|------|----------|------|
 | car | 0.916 | 0.918 | +0.002 |
 | truck | 0.833 | 0.840 | +0.007 |
 | bus | 0.995 | 0.995 | 0.000 |
@@ -285,7 +307,9 @@ python tools/quant_benchmark.py \
 
 ---
 
-## TensorRT 部署
+## TensorRT 部署（Legacy）
+
+> 以下 TRT Hybrid 部署方案仅覆盖 4 个 torch.fx 兼容模块（路径 ① 的模块）。手动量化的模块（路径 ②③）的 TRT 部署尚未实现。
 
 ### 部署方案
 
@@ -332,7 +356,7 @@ FP32 PyTorch 子模块 → torch.onnx.export → FP32 ONNX → TRT INT8/FP16 原
 
 | 脚本 | 功能 | 状态 |
 |------|------|------|
-| `tools/trt_eval_hybrid_all.py` | 4/5 模块全部导出 + 端到端 NDS 评估 | ✅ SwinT 4 模块 / ResNet-50 5 模块已验证 |
+| `tools/trt_eval_hybrid_all.py` | fx 兼容模块 TRT 导出 + Hybrid 端到端 NDS 评估 | ✅ SwinT 4 模块已验证 |
 
 ### 使用方法
 

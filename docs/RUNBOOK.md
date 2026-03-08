@@ -33,23 +33,65 @@ python tools/test.py `
 
 ---
 
-## 2. PTQ 4/6 完整 NDS 评估（NDS = 0.5810）
+## 2. PTQ 全模型 INT8 评估（8/8 模块量化）
 
-**数据来源**：RESULTS_LOG「PTQ（MinMax，4/6 模块量化）完整 NDS 评估」
+**三路径量化**：校准（32 batch）→ 量化推理（81 样本）→ NDS/mAP 评估 → 保存 checkpoint
 
-此命令同时执行：校准（128 batch）→ 量化推理（81 样本）→ NDS/mAP 评估 → 保存 checkpoint
+### 2.1 全模型 INT8（8/8 模块，NDS ≈ 0.4276）
 
 ```powershell
 $env:PYTHONUTF8="1"
 python tools/quant_ptq_minmax.py `
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
     --load_from pretrained/bevfusion-det.pth `
-    --calib-batches 128 2>&1 | Tee-Object -FilePath "logs/results_ptq_eval.log"
+    --calib-batches 32 2>&1 | Tee-Object -FilePath "logs/results_ptq_8of8.log"
 ```
 
-**预期输出**（日志末尾）：NDS ≈ 0.5810, mAP ≈ 0.5759
+### 2.2 推荐配置：6/8 模块 INT8（跳过精度敏感模块，NDS ≈ 0.5799）
 
-> ⚠️ 不要加 `--no-eval`，否则会跳过精度评估。
+```powershell
+$env:PYTHONUTF8="1"
+python tools/quant_ptq_minmax.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    --load_from pretrained/bevfusion-det.pth `
+    --calib-batches 32 `
+    --skip-modules camera/vtransform lidar/backbone 2>&1 | Tee-Object -FilePath "logs/results_ptq_6of8.log"
+```
+
+### 2.3 消融：7/8 模块（仅加 vtransform，NDS ≈ 0.5485）
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/quant_ptq_minmax.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    --load_from pretrained/bevfusion-det.pth `
+    --calib-batches 32 `
+    --skip-modules lidar/backbone 2>&1 | Tee-Object -FilePath "logs/results_ptq_7of8_vtrans.log"
+```
+
+### 2.4 消融：7/8 模块（仅加 lidar/backbone，NDS ≈ 0.4803）
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/quant_ptq_minmax.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    --load_from pretrained/bevfusion-det.pth `
+    --calib-batches 32 `
+    --skip-modules camera/vtransform 2>&1 | Tee-Object -FilePath "logs/results_ptq_7of8_lidar.log"
+```
+
+### 2.5 诊断模式：逐模块 INT8 余弦相似度
+
+```powershell
+$env:PYTHONUTF8="1"
+python tools/quant_ptq_minmax.py `
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml `
+    --load_from pretrained/bevfusion-det.pth `
+    --calib-batches 32 `
+    --diagnose --diagnose-samples 5 2>&1 | Tee-Object -FilePath "logs/results_ptq_diagnose.log"
+```
+
+> ⚠️ PTQ checkpoint 含 FakeQuant 结构，不能用 `tools/test.py` 直接评估。
 
 ---
 
@@ -263,14 +305,25 @@ python tools/test.py \
     --eval bbox 2>&1 | tee logs/results_swint_fulldata_fp32.log
 ```
 
-### PTQ 4/6 模块量化 + 评估
+### PTQ 8/8 全模型量化 + 评估
 
 ```bash
 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load_from pretrained/bevfusion-det.pth \
     --run-dir runs/swint_ptq \
-    --calib-batches 128 2>&1 | tee logs/results_swint_fulldata_ptq.log
+    --calib-batches 128 2>&1 | tee logs/results_swint_fulldata_ptq_8of8.log
+```
+
+### PTQ 6/8 推荐配置（跳过敏感模块）
+
+```bash
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --run-dir runs/swint_ptq_6of8 \
+    --skip-modules camera/vtransform lidar/backbone \
+    --calib-batches 128 2>&1 | tee logs/results_swint_fulldata_ptq_6of8.log
 ```
 
 ---

@@ -4,23 +4,24 @@
 BEVFusion PTQ (Post-Training Quantization) with MQBench — MinMax Calibration
 =============================================================================
 
-策略：对适合量化的子模块进行 PTQ，跳过不适合量化的部分。
+策略：对全模型 8/8 子模块进行 PTQ，采用三种量化路径覆盖所有模块：
 
-量化部分（标准密集卷积，torch.fx 可追踪）：
-  - Camera backbone (SwinTransformer / ResNet)
+量化路径一（torch.fx 自动插桩）：
   - Camera neck (GeneralizedLSSFPN / FPN)
   - Fuser (ConvFuser)
   - Decoder backbone (SECOND)
   - Decoder neck (SECONDFPN)
-  - Detection / Segmentation heads
 
-跳过部分（含自定义 CUDA 算子或稀疏卷积，不适合标准量化）：
-  - Camera vtransform (BaseTransform / LSSTransform / DepthLSSTransform)
-    → 内部含 bev_pool 自定义 CUDA 算子
-  - LiDAR / Radar voxelize (Voxelization / DynamicScatter)
-    → 体素化预处理，非神经网络层
-  - LiDAR / Radar backbone (SparseEncoder)
-    → 稀疏卷积，不兼容标准 FakeQuant 节点
+量化路径二（手动 FakeQuant 包装 Conv2d/Linear）：
+  - Camera backbone (SwinTransformer) — fx 失败于 AdaptivePadding 动态控制流
+  - Camera vtransform (DepthLSSTransform) — fx 失败于 bev_pool CUDA 算子
+  - Detection / Segmentation heads — fx 失败于 Proxy 迭代
+
+量化路径三（手动 FakeQuant 包装 SparseConvolution）：
+  - LiDAR backbone (SparseEncoder) — 稀疏卷积 features 量化 + weight 临时替换
+
+跳过部分（非神经网络层）：
+  - LiDAR / Radar voxelize (Voxelization / DynamicScatter) — 体素化预处理
 
 使用示例：
     # 单 GPU
@@ -71,6 +72,11 @@ except ImportError:
         "pip install mqbench"
     )
     raise
+
+# spconv imports（用于稀疏卷积量化）
+from mmdet3d.ops.spconv.conv import SparseConvolution
+from mmdet3d.ops.spconv.modules import SparseModule
+from mmdet3d.ops.spconv.structure import SparseConvTensor
 
 
 # 临时修补 mmcv 的 Conv/Linear 包装层，使 torch.fx 追踪时不触发 Proxy 布尔判断报错
@@ -217,33 +223,115 @@ def manual_quantize_nontraceable(module, logger, module_name="unknown"):
 
 
 # ============================================================================
-# 选择性量化：只量化适合量化的子模块
+# 稀疏卷积量化：为 SparseEncoder (spconv v1.x) 提供 FakeQuant 支持
 # ============================================================================
 
-# 量化适用性说明：
+def _create_spconv_fakeq_pair():
+    """创建 per-channel 量化的 FakeQuant 对，适用于稀疏卷积。
+
+    稀疏卷积权重形状为 [K,K,K,C_in,C_out]，与标准 Conv2d [C_out,C_in,K,K] 不同，
+    per-channel 的 ch_axis 需要设为 4（输出通道维度）。
+    """
+    w_params = QuantizeScheme(
+        symmetry=True, per_channel=True, pot_scale=False,
+        bit=8, symmetric_range=True
+    ).to_observer_params()
+    # 稀疏卷积权重输出通道在最后一维 (axis=4)
+    w_params['ch_axis'] = 4
+    a_params = QuantizeScheme(
+        symmetry=True, per_channel=False, pot_scale=False,
+        bit=8, symmetric_range=True
+    ).to_observer_params()
+    weight_fq = LearnableFakeQuantize(observer=MinMaxObserver, **w_params)
+    act_fq = LearnableFakeQuantize(observer=EMAMinMaxObserver, **a_params)
+    return weight_fq, act_fq
+
+
+class _QuantizedSparseConv(SparseModule):
+    """SparseConvolution + FakeQuantize（spconv v1.x 稀疏卷积量化）。
+
+    继承 SparseModule 以确保 SparseSequential 正确路由 SparseConvTensor。
+    量化方式：
+      - 激活量化：对 SparseConvTensor.features（标准密集张量）施加 FakeQuant
+      - 权重量化：临时替换 weight.data 为 FakeQuant 后的版本，调用原始 forward
+    """
+
+    def __init__(self, original):
+        super().__init__()
+        self.conv = original
+        self.weight_fake_quant, self.act_fake_quant = _create_spconv_fakeq_pair()
+
+    @property
+    def weight(self):
+        return self.conv.weight
+
+    @property
+    def bias(self):
+        return self.conv.bias
+
+    def forward(self, input):
+        assert isinstance(input, SparseConvTensor)
+        # 量化激活值（features 是标准密集张量 [N, C]）
+        input.features = self.act_fake_quant(input.features)
+        # 量化权重：临时替换后调用原始 forward
+        saved_weight = self.conv.weight.data
+        self.conv.weight.data = self.weight_fake_quant(saved_weight)
+        output = self.conv(input)
+        self.conv.weight.data = saved_weight
+        return output
+
+
+def manual_quantize_sparse(module, logger, module_name="unknown"):
+    """对 SparseEncoder 中的稀疏卷积层插入 FakeQuantize 节点。
+
+    替换所有 SparseConvolution (SubMConv3d/SparseConv3d) 为带 FakeQuant 的包装版本。
+    BatchNorm1d / ReLU 等非稀疏层不受影响。
+    """
+    replacements = []
+    for name, child in list(module.named_modules()):
+        if isinstance(child, SparseConvolution) and not isinstance(
+            child, _QuantizedSparseConv
+        ):
+            replacements.append((name, _QuantizedSparseConv(child)))
+
+    for name, replacement in replacements:
+        _set_nested_attr(module, name, replacement)
+
+    fq_count = len(replacements) * 2
+    logger.info(
+        f"  ↪ 稀疏卷积量化 {module_name}: 替换 {len(replacements)} 个 SparseConv，"
+        f"插入 {fq_count} 个 FakeQuant 节点"
+    )
+    return module
+
+
+# ============================================================================
+# 选择性量化：对全模型 8/8 子模块插入 FakeQuantize 节点
+# ============================================================================
+
+# 量化路径说明：
 #
-# ✓ 可量化：Camera backbone/neck, Fuser, Decoder backbone/neck, Heads
-#   - 标准密集卷积 (Conv2d / Linear / BN), torch.fx 可正常追踪
+# 路径一（torch.fx 自动）：camera/neck, fuser, decoder/backbone, decoder/neck
+# 路径二（手动 Conv2d/Linear 包装）：camera/backbone, camera/vtransform, heads
+# 路径三（手动 SparseConv 包装）：lidar/backbone
 #
-# ✗ 不可量化（跳过）：
-#   1. vtransform (LSSTransform / DepthLSSTransform / BaseTransform)
-#      - 内部调用 bev_pool (QuickCumsumCuda) ── 自定义 CUDA autograd Function
-#      - 包含 nonzero / argsort / dynamic indexing 等 torch.fx 不支持的控制流
-#   2. LiDAR/Radar voxelize (Voxelization / DynamicScatter)
-#      - 点云体素化，纯预处理操作，非可微分层
-#   3. LiDAR/Radar backbone (SparseEncoder)
-#      - 稀疏卷积 (spconv)，输入输出均为稀疏张量，FakeQuant 节点无法插入
+# 设计跳过：lidar/voxelize (体素化预处理，非神经网络层)
 
 _QUANTIZABLE_SUBMODULE_KEYS = [
     # (attr_path_on_model, display_name)
     # camera branch
-    ("encoders.camera.backbone",  "camera/backbone"),
-    ("encoders.camera.neck",      "camera/neck"),
+    ("encoders.camera.backbone",    "camera/backbone"),
+    ("encoders.camera.neck",        "camera/neck"),
+    ("encoders.camera.vtransform",  "camera/vtransform"),
+    # lidar branch
+    ("encoders.lidar.backbone",     "lidar/backbone"),
     # fuser
-    ("fuser",                     "fuser"),
+    ("fuser",                       "fuser"),
     # decoder
-    ("decoder.backbone",          "decoder/backbone"),
-    ("decoder.neck",              "decoder/neck"),
+    ("decoder.backbone",            "decoder/backbone"),
+    ("decoder.neck",                "decoder/neck"),
+    # heads (TransFusionHead)
+    ("decoder.heads.object",        "heads/object"),
 ]
 
 # heads 单独遍历（数量不定）
@@ -280,77 +368,99 @@ def _set_nested_attr(obj, key: str, value):
         setattr(obj, last, value)
 
 
-def apply_selective_ptq(model, backend_type, logger):
+def apply_selective_ptq(model, backend_type, logger, skip_modules=None):
     """
-    对模型中适合量化的子模块逐一调用 prepare_by_platform，
-    跳过 vtransform / voxelize / sparse-backbone 等不适合量化的部分。
+    对模型中全部可量化子模块插入 FakeQuantize 节点。
 
-    该函数的核心思想是“选择性量化”：只对标准密集算子分支做 FX 插桩，
-    并用日志记录成功/失败/跳过的子模块，确保流程可控、可回溯。
+    三条量化路径：
+      1. torch.fx 自动插桩（标准密集卷积模块）
+      2. 手动 FakeQuant 包装 Conv2d/Linear（fx 追踪失败的密集模块）
+      3. 手动 FakeQuant 包装 SparseConvolution（稀疏卷积模块）
 
     Args:
         model (nn.Module): 原始浮点模型
         backend_type (BackendType): 目标后端（TensorRT）
+        skip_modules (list[str] | None): 要跳过的模块 display_name 列表
         logger: 日志记录器
 
     Returns:
-        nn.Module: 已对可量化子模块插入 FakeQuantize 节点的模型
+        nn.Module: 已对全部可量化子模块插入 FakeQuantize 节点的模型
     """
     success, failed, skipped = [], [], []
 
-    # --- 固定路径的子模块 ---
-    # 逐个按路径获取子模块，使用 patch_mmcv_for_fx 保护 FX 追踪
-    for attr_key, display_name in _QUANTIZABLE_SUBMODULE_KEYS:
-        try:
-            submodule = _get_nested_attr(model, attr_key)
-        except (KeyError, AttributeError):
-            # 该分支不存在（如纯 LiDAR 配置没有 camera 分支）
-            skipped.append(display_name)
-            continue
+    def _has_sparse_conv(module):
+        """检查模块是否包含稀疏卷积层。"""
+        return any(isinstance(m, SparseConvolution) for m in module.modules())
 
+    def _try_quantize(submodule, display_name, attr_key=None, set_back=None):
+        """尝试量化单个子模块，依次尝试三条路径。"""
+        # 路径 1: torch.fx 自动插桩
         try:
-            # 关键点：临时修补 mmcv wrapper，避免 FX 因 if x.numel()==0 报错
             with patch_mmcv_for_fx():
                 quantized = prepare_by_platform(submodule, backend_type)
-            # 将量化后的子模块写回模型
-            _set_nested_attr(model, attr_key, quantized)
+            if attr_key:
+                _set_nested_attr(model, attr_key, quantized)
+            elif set_back:
+                set_back(quantized)
             success.append(display_name)
             logger.info(f"  ✓ 量化子模块: {display_name} (fx)")
+            return
         except Exception as e:
-            # torch.fx 追踪失败，回退到手动量化（逐层包装 Conv2d/Linear）
             logger.warning(
                 f"  ✗ {display_name} torch.fx 追踪失败: "
                 f"{type(e).__name__}: {str(e)[:80]}"
             )
+
+        # 路径 3: 稀疏卷积量化（SparseEncoder 内无 Conv2d，需专用处理）
+        if _has_sparse_conv(submodule):
             try:
-                manual_quantize_nontraceable(submodule, logger, display_name)
-                success.append(f"{display_name} (手动)")
+                manual_quantize_sparse(submodule, logger, display_name)
+                success.append(f"{display_name} (稀疏)")
+                return
             except Exception as e2:
                 failed.append(display_name)
-                logger.warning(f"  ✗ {display_name} 手动量化也失败: {e2}")
+                logger.warning(f"  ✗ {display_name} 稀疏卷积量化失败: {e2}")
+                return
+
+        # 路径 2: 手动 FakeQuant 包装 Conv2d/Linear
+        try:
+            manual_quantize_nontraceable(submodule, logger, display_name)
+            success.append(f"{display_name} (手动)")
+        except Exception as e2:
+            failed.append(display_name)
+            logger.warning(f"  ✗ {display_name} 手动量化也失败: {e2}")
+
+    if skip_modules is None:
+        skip_modules = []
+
+    # --- 固定路径的子模块 ---
+    for attr_key, display_name in _QUANTIZABLE_SUBMODULE_KEYS:
+        if display_name in skip_modules:
+            skipped.append(f"{display_name} (--skip-modules)")
+            logger.info(f"  ⊘ 跳过子模块: {display_name} (--skip-modules)")
+            continue
+        try:
+            submodule = _get_nested_attr(model, attr_key)
+        except (KeyError, AttributeError):
+            skipped.append(display_name)
+            continue
+        _try_quantize(submodule, display_name, attr_key=attr_key)
 
     # --- heads（数量可变）---
-    # heads 是 ModuleDict，名称不固定，因此逐项遍历量化
     if hasattr(model, "heads"):
         for head_name, head_module in model.heads.items():
             display_name = f"heads/{head_name}"
-            try:
-                with patch_mmcv_for_fx():
-                    quantized_head = prepare_by_platform(head_module, backend_type)
-                model.heads[head_name] = quantized_head
-                success.append(display_name)
-                logger.info(f"  ✓ 量化子模块: {display_name} (fx)")
-            except Exception as e:
-                logger.warning(
-                    f"  ✗ {display_name} torch.fx 追踪失败: "
-                    f"{type(e).__name__}: {str(e)[:80]}"
-                )
-                try:
-                    manual_quantize_nontraceable(head_module, logger, display_name)
-                    success.append(f"{display_name} (手动)")
-                except Exception as e2:
-                    failed.append(display_name)
-                    logger.warning(f"  ✗ {display_name} 手动量化也失败: {e2}")
+            if display_name in skip_modules:
+                skipped.append(f"{display_name} (--skip-modules)")
+                logger.info(f"  ⊘ 跳过子模块: {display_name} (--skip-modules)")
+                continue
+            # 如果已在 _QUANTIZABLE_SUBMODULE_KEYS 中处理过则跳过
+            if display_name in success or any(display_name in s for s in success):
+                continue
+            _try_quantize(
+                head_module, display_name,
+                set_back=lambda q, hn=head_name: model.heads.__setitem__(hn, q),
+            )
 
     logger.info(
         f"选择性量化完成: 成功 {len(success)} 个, "
@@ -361,17 +471,16 @@ def apply_selective_ptq(model, backend_type, logger):
 
     # 标记不量化的部分（仅供日志参考）
     skipped_by_design = [
-        "camera/vtransform (含 bev_pool CUDA 算子)",
-        "lidar/voxelize    (体素化预处理)",
-        "lidar/backbone    (SparseEncoder 稀疏卷积)",
-        "radar/voxelize    (体素化预处理，如有)",
-        "radar/backbone    (SparseEncoder 稀疏卷积，如有)",
+        "lidar/voxelize  (体素化预处理，非神经网络层)",
+        "radar/voxelize  (体素化预处理，如有)",
     ]
-    logger.info("以下部分已设计跳过量化（不适合标准 PTQ）：")
-    for item in skipped_by_design:
-        logger.info(f"  - {item}")
+    if skipped_by_design:
+        logger.info("以下部分已设计跳过量化（非神经网络层）：")
+        for item in skipped_by_design:
+            logger.info(f"  - {item}")
 
     return model
+
 
 
 # ============================================================================
@@ -424,13 +533,14 @@ def run_calibration(model, data_loader, num_batches, logger):
 # 构建模型
 # ============================================================================
 
-def build_ptq_model(cfg, logger):
+def build_ptq_model(cfg, logger, skip_modules=None):
     """
     构建浮点模型，加载预训练权重，再对可量化子模块进行 PTQ 准备。
 
     Args:
         cfg: mmcv Config 对象
         logger: 日志记录器
+        skip_modules (list[str] | None): 要跳过的模块 display_name 列表
 
     Returns:
         nn.Module: 已对可量化子模块插入 FakeQuantize 节点的模型
@@ -456,7 +566,7 @@ def build_ptq_model(cfg, logger):
     # 4. 选择性 PTQ 准备（仅对可量化子模块插入 FakeQuantize 节点）
     backend_type = BackendType.Tensorrt
     logger.info("开始对可量化子模块进行 PTQ 准备 (MinMax + TensorRT INT8) ...")
-    model = apply_selective_ptq(model, backend_type, logger)
+    model = apply_selective_ptq(model, backend_type, logger, skip_modules=skip_modules)
 
     return model
 
@@ -676,10 +786,12 @@ def diagnose_quantization_effect(model, data_loader, logger, num_samples=5):
         logger.info("  ✅ 所有已量化模块的 FakeQuant 节点均正常工作")
         logger.info("  ✅ INT8 输出与 FP32 存在可测量差异，量化已正确生效")
         logger.info("")
-        if q_pct >= 80:
+        if q_pct >= 99:
+            logger.info(f"  📊 量化覆盖率 {q_pct:.1f}%（全模型 INT8）")
+            logger.info("     NDS 下降取决于各模块的量化敏感度。")
+        elif q_pct >= 80:
             logger.info(f"  📊 量化覆盖率 {q_pct:.1f}%（{u_pct:.1f}% 仍为 FP32）")
             logger.info("     覆盖率已较高，NDS 下降主要取决于各模块的量化敏感度。")
-            logger.info("     未量化部分：camera/vtransform (bev_pool CUDA) + lidar/backbone (spconv)")
         else:
             logger.info("  💡 FP32 ≈ INT8 (NDS 几乎无差异) 的原因:")
             logger.info(
@@ -753,6 +865,13 @@ def main():
         default=5,
         help="number of samples for quantization diagnosis (default: 5)",
     )
+    parser.add_argument(
+        "--skip-modules",
+        type=str,
+        nargs="+",
+        default=[],
+        help="display names of modules to skip (e.g. --skip-modules camera/vtransform lidar/backbone)",
+    )
     args, opts = parser.parse_known_args()
 
     configs.load(args.config, recursive=True)
@@ -821,7 +940,7 @@ def main():
     # Step 2: 构建 PTQ 模型
     # ------------------------------------------------------------------
     logger.info("构建 PTQ 模型（选择性 MinMax 量化）...")
-    model = build_ptq_model(cfg, logger)
+    model = build_ptq_model(cfg, logger, skip_modules=args.skip_modules)
     model = MMDataParallel(model.cuda(), device_ids=[0])
     logger.info("模型已移动到 GPU（MMDataParallel）。")
 
