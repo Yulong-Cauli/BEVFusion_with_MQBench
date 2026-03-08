@@ -18,11 +18,8 @@ git archive HEAD --format=tar.gz -o code_update.tar.gz `
     tools/quant_benchmark.py `
     tools/train.py `
     tools/trt_eval_hybrid_all.py `
-    tools/trt_eval_hybrid.py `
-    tools/trt_export_fuser.py `
-    tools/trt_accuracy_test.py `
-    tools/benchmark.py `
     tools/make_ppt.py `
+    tools/test.py `
     tools/scripts/ `
     mmdet3d/datasets/nuscenes_dataset.py `
     mmdet3d/datasets/pipelines/formating.py `
