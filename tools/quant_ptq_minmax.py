@@ -479,7 +479,7 @@ def apply_selective_ptq(model, backend_type, logger, skip_modules=None):
         for item in skipped_by_design:
             logger.info(f"  - {item}")
 
-    return model
+    return model, success, failed
 
 
 
@@ -566,9 +566,9 @@ def build_ptq_model(cfg, logger, skip_modules=None):
     # 4. 选择性 PTQ 准备（仅对可量化子模块插入 FakeQuantize 节点）
     backend_type = BackendType.Tensorrt
     logger.info("开始对可量化子模块进行 PTQ 准备 (MinMax + TensorRT INT8) ...")
-    model = apply_selective_ptq(model, backend_type, logger, skip_modules=skip_modules)
+    model, success, failed = apply_selective_ptq(model, backend_type, logger, skip_modules=skip_modules)
 
-    return model
+    return model, success, failed
 
 
 # ============================================================================
@@ -940,9 +940,42 @@ def main():
     # Step 2: 构建 PTQ 模型
     # ------------------------------------------------------------------
     logger.info("构建 PTQ 模型（选择性 MinMax 量化）...")
-    model = build_ptq_model(cfg, logger, skip_modules=args.skip_modules)
+    model, quant_success, quant_failed = build_ptq_model(cfg, logger, skip_modules=args.skip_modules)
     model = MMDataParallel(model.cuda(), device_ids=[0])
     logger.info("模型已移动到 GPU（MMDataParallel）。")
+
+    # ------------------------------------------------------------------
+    # ★ 量化结果摘要（校准开始前，请确认后继续）
+    # ------------------------------------------------------------------
+    _EXPECTED_QUANT = {k for k, _ in _QUANTIZABLE_SUBMODULE_KEYS} | {"heads/object"}
+    _skipped_set = set(args.skip_modules)
+    total_possible = len(_EXPECTED_QUANT - _skipped_set)
+    coverage_pct = len(quant_success) / max(total_possible, 1) * 100
+
+    logger.info("")
+    logger.info("╔══════════════════════════════════════════════════════════════╗")
+    logger.info("║             ★ 量化摘要 — 校准即将开始，请检查！ ★              ║")
+    logger.info("╠══════════════════════════════════════════════════════════════╣")
+    logger.info(f"║  成功量化: {len(quant_success):>2d} 个模块  →  {', '.join(quant_success) if quant_success else '(无)'}")
+    logger.info(f"║  量化失败: {len(quant_failed):>2d} 个模块  →  {', '.join(quant_failed) if quant_failed else '(无)'}")
+    logger.info(f"║  主动跳过: {', '.join(args.skip_modules) if args.skip_modules else '(无)'}")
+    logger.info(f"║  覆盖率  : {coverage_pct:.0f}%  ({len(quant_success)}/{total_possible} 个可量化模块)")
+    if quant_failed:
+        logger.warning("║")
+        logger.warning("║  ⚠️  有模块量化失败！如果结果不符合预期，请 Ctrl+C 停止。")
+        logger.warning("║  ⚠️  失败模块将以 FP32 运行，不影响正确性，但会降低量化覆盖率。")
+    else:
+        logger.info("║  ✅  所有预期模块均量化成功！")
+    logger.info("╚══════════════════════════════════════════════════════════════╝")
+    logger.info("")
+
+    if quant_failed:
+        logger.warning(f"⏳ 5 秒后自动继续校准...（如需停止请按 Ctrl+C）")
+        for i in range(5, 0, -1):
+            logger.warning(f"   继续倒计时: {i}s ...")
+            time.sleep(1)
+    logger.info("→ 开始校准，预计耗时较长，请勿中断...")
+    logger.info("")
 
     # ------------------------------------------------------------------
     # Step 3: MinMax 校准
