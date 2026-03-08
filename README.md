@@ -29,11 +29,11 @@
 
 | 脚本 | 功能 |
 |------|------|
+| `tools/test.py` | **FP32 评估** — 基准精度测试 |
+| `tools/train.py` | **训练** — 分布式训练（torchrun） |
 | `tools/quant_ptq_minmax.py` | **PTQ** — MinMax 校准 + 精度评估 |
 | `tools/quant_benchmark.py` | **Benchmark** — 模型大小与推理延迟测量 |
-| `tools/trt_eval_hybrid_all.py` | **TRT 全模块评估** — 4 模块 TRT 导出 + Hybrid 端到端 NDS 评估 |
-| `tools/trt_eval_hybrid.py` | **TRT 单模块评估** — 仅 ConvFuser 替换（调试/对比用） |
-| `tools/trt_export_fuser.py` | **TRT 导出** — ConvFuser 隔离延迟测试 |
+| `tools/trt_eval_hybrid_all.py` | **TRT 全模块评估** — 4/5 模块 TRT 导出 + Hybrid 端到端 NDS 评估 |
 
 目标后端：**NVIDIA TensorRT INT8**
 
@@ -332,9 +332,7 @@ FP32 PyTorch 子模块 → torch.onnx.export → FP32 ONNX → TRT INT8/FP16 原
 
 | 脚本 | 功能 | 状态 |
 |------|------|------|
-| `tools/trt_eval_hybrid_all.py` | 4 模块全部导出 + 端到端 NDS 评估 | ✅ FP32/FP16/INT8 已验证 |
-| `tools/trt_eval_hybrid.py` | 仅 ConvFuser 替换 + NDS 评估（调试用） | ✅ 已验证 |
-| `tools/trt_export_fuser.py` | ConvFuser 隔离延迟测试 | ✅ 已验证 |
+| `tools/trt_eval_hybrid_all.py` | 4/5 模块全部导出 + 端到端 NDS 评估 | ✅ SwinT 4 模块 / ResNet-50 5 模块已验证 |
 
 ### 使用方法
 
@@ -364,9 +362,8 @@ pip install tensorrt onnx onnxruntime
 |------|------|
 | [docs/REPORT.md](docs/REPORT.md) | 完整技术报告（量化原理、实现细节、实验结果） |
 | [docs/RESULTS_LOG.md](docs/RESULTS_LOG.md) | 所有评测结果记录（FP32 / PTQ / TRT 精度、速度、大小） |
-| [docs/PTQ_BENCHMARK_NOTES.md](docs/PTQ_BENCHMARK_NOTES.md) | 量化覆盖问题分析、TRT 导出方案、开放问题 |
-| [docs/RUNBOOK.md](docs/RUNBOOK.md) | 可复现运行手册（所有命令） |
-| [AGENTS.md](AGENTS.md) | Agent 工作说明（环境约束、已知问题） |
+| [docs/PTQ_BENCHMARK_NOTES.md](docs/PTQ_BENCHMARK_NOTES.md) | 量化覆盖问题分析、TRT 导出方案 |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | 可复现运行手册（所有命令 + 服务器部署） |
 
 ---
 

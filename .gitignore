@@ -134,6 +134,16 @@ data/*
 runs/*
 pretrained/*.pth
 
+# Logs and artifacts
+logs/
+server_artifacts/
+severlog/
+results_vis/
+
+# IDE
+.idea/
+.vscode/
+
 # torch hipify generated files
 *_hip.*
 *.hip

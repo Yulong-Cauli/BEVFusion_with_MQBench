@@ -158,7 +158,7 @@ TransFusionHead 有 `for layer in self.decoder_layers:` 等动态迭代。可以
 **已验证方案（绕过 MQBench 导出限制）：**
 
 MQBench `convert_deploy` 和 `torch.onnx.export` 都无法导出 FakeQuant 模型（PyTorch 1.10 缺少自定义 op 的 ONNX symbolic）。
-实际可行方案：导出 FP32 ONNX → TRT `IInt8EntropyCalibrator2` 做 INT8 校准 → 构建引擎。
+实际可行方案：导出 FP32 ONNX → TRT `IInt8MinMaxCalibrator` 做 INT8 校准 → 构建引擎。
 
 **全模块 TRT Hybrid 结果：**
 
@@ -209,7 +209,7 @@ PyTorch 执行（未量化或 ONNX 不兼容）：
 
 1. ✅ 安装 TensorRT（`pip install tensorrt`，实际使用 TRT 10.15.1.29）
 2. ✅ 逐模块 ONNX 导出：`tools/trt_eval_hybrid_all.py` 中的 export wrapper 对每个子模块进行 `torch.onnx.export`
-3. ✅ 构建 FP32/FP16/INT8 引擎：TRT Python API + `IInt8EntropyCalibrator2`（50 样本校准）
+3. ✅ 构建 FP32/FP16/INT8 引擎：TRT Python API + `IInt8MinMaxCalibrator`（50 样本校准）
 4. ✅ Hybrid Runner：TRT 引擎处理 4 个子模块，PyTorch 处理其余部分
 5. ✅ 验证一致性：FP32 余弦相似度 1.000000，FP16 ≥ 0.999993，端到端 NDS 验证通过
 

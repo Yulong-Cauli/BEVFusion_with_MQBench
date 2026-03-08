@@ -32,9 +32,9 @@ set -e
 WORK_DIR="/media/yellowstone/data2/CYL/BEVFusion_with_MQBench"
 CONDA_ENV="bevfusion_mqbench"
 GPU_ID=0  # RTX 3090 24GB (GPU#2 A100 不能训练)
-NUM_GPUS=1  # 单GPU训练。设 2/3/4 可多卡并行(需 torchpack)
-BATCH_SIZE=4
-WORKERS=8
+NUM_GPUS=4  # 4张 RTX 3090 并行。GPU#2 A100 会被自动跳过
+BATCH_SIZE=2  # 每卡 batch=2 (3090 24GB, batch=4 需要~31GB 会 OOM)
+WORKERS=4
 MAX_EPOCHS=6
 RUN_DIR="runs/resnet50_fulldata"
 
@@ -219,13 +219,18 @@ start_training() {
         [ -d "$cuda_dir" ] && { export CUDA_HOME="$cuda_dir"; break; }
     done
 
+    # GPU 设备编排:
+    # 服务器 GPU 布局: 0,1=RTX3090, 2=A100(跳过), 3,4=RTX3090
+    # CUDA_DEVICE_ORDER=PCI_BUS_ID 让 CUDA 编号与 nvidia-smi 一致
+    GPU_LIST=$(echo "0 1 3 4" | tr ' ' '\n' | head -$NUM_GPUS | tr '\n' ',' | sed 's/,$//')
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+    export CUDA_VISIBLE_DEVICES=$GPU_LIST
+
     if [ "$NUM_GPUS" -gt 1 ]; then
-        # 多GPU: 使用 torchpack 分布式训练
-        # GPU 0,1,3,4 是 RTX 3090 (跳过 GPU#2 A100)
-        GPU_LIST=$(seq 0 $((NUM_GPUS > 4 ? 3 : NUM_GPUS - 1)) | grep -v 2 | head -$NUM_GPUS | tr '\n' ',' | sed 's/,$//')
-        log_info "多GPU模式: CUDA_VISIBLE_DEVICES=$GPU_LIST, np=$NUM_GPUS"
-        CUDA_VISIBLE_DEVICES=$GPU_LIST nohup torchpack dist-run -np $NUM_GPUS \
-            python tools/train.py \
+        # 多GPU: 使用 torchrun（PyTorch 内置，无需 mpi4py/OpenMPI）
+        log_info "多GPU模式: torchrun --nproc_per_node=$NUM_GPUS, CUDA_VISIBLE_DEVICES=$GPU_LIST"
+        nohup torchrun --nproc_per_node=$NUM_GPUS --standalone \
+            tools/train.py \
             "$CONFIG" --run-dir "$RUN_DIR" $NO_VAL \
             data.samples_per_gpu=$BATCH_SIZE data.workers_per_gpu=$WORKERS \
             max_epochs=$MAX_EPOCHS $RESUME_FLAG \

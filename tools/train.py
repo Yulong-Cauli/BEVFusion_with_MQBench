@@ -4,43 +4,74 @@ import os
 import sys
 sys.path.append(os.getcwd())
 import random
-import time  # 时间模块（记录时间戳）
+import time
 
 import numpy as np
 import torch
-from mmcv import Config  # MMCV配置管理
-from torchpack import distributed as dist  # 分布式训练（多GPU）
-from torchpack.environ import auto_set_run_dir, set_run_dir  # 自动设置运行目录
-from torchpack.utils.config import configs  # 配置加载工具
+from mmcv import Config
+from torchpack import distributed as dist
+from torchpack.environ import auto_set_run_dir, set_run_dir
+from torchpack.utils.config import configs
 
-from mmdet3d.apis import train_model  # 3D目标检测训练函数
-from mmdet3d.datasets import build_dataset  # 数据集构建器
-from mmdet3d.models import build_model  # 模型构建器
+from mmdet3d.apis import train_model
+from mmdet3d.datasets import build_dataset
+from mmdet3d.models import build_model
 from mmdet3d.utils import get_root_logger, convert_sync_batchnorm, recursive_eval
+
+
+def _init_distributed():
+    """初始化分布式训练，同时支持 torchpack/mpirun 和 torchrun 两种启动器。
+
+    返回 True 表示已启用分布式，False 表示单卡模式。
+    """
+    # 方式 1: torchpack dist-run / mpirun (OpenMPI)
+    #   特征: 设置 OMPI_COMM_WORLD_RANK 环境变量
+    #   torchpack.distributed.init() 内部用 mpi4py 获取 rank，
+    #   并读取 MASTER_HOST 做 torch.distributed.init_process_group
+    if 'OMPI_COMM_WORLD_RANK' in os.environ:
+        dist.init()
+        return True
+
+    # 方式 2: torchrun / torch.distributed.launch
+    #   特征: 设置 RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR, MASTER_PORT
+    #   不走 mpi4py，直接用 torch.distributed 的 env:// 初始化
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend='nccl',
+                init_method='env://',
+                world_size=world_size,
+                rank=rank,
+            )
+
+        # 补丁 torchpack 模块变量，使 dist.rank() / dist.local_rank() 等仍可用
+        import torchpack.distributed.context as _tp_ctx
+        _tp_ctx._world_size = world_size
+        _tp_ctx._world_rank = rank
+        _tp_ctx._local_size = world_size  # 单节点假设
+        _tp_ctx._local_rank = local_rank
+        return True
+
+    return False
 
 
 def main():
     # ========== 初始化分布式训练 ==========
-    # 设置多GPU分布式训练环境（torchpack框架）
-    # 检测环境变量RANK和WORLD_SIZE，如果有则启用分布式模式
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        dist.init()
-        distributed = True
-    else:
-        distributed = False
-        # 单机模式下默认使用第一块GPU
+    distributed = _init_distributed()
+    if not distributed:
         if torch.cuda.is_available():
             torch.cuda.set_device(0)
 
     # ========== 命令行参数解析 ==========
     parser = argparse.ArgumentParser()
-    # 位置参数：配置文件路径（必需）
     parser.add_argument("config", metavar="FILE", help="config file")
-    # 可选参数：运行输出目录
     parser.add_argument("--run-dir", metavar="DIR", help="run directory")
     parser.add_argument("--no-validate", action="store_true",
                         help="skip validation during training (useful when sweeps data unavailable)")
-    # args: 主要参数，opts: 其他选项（如学习率等）
     args, opts = parser.parse_known_args()
 
     # ========== 配置加载与合并 ==========

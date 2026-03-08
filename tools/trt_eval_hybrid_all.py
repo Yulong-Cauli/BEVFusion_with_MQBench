@@ -1,14 +1,17 @@
 """
 Multi-module TRT Hybrid Evaluation.
 
-Exports 4 quantizable modules to TensorRT engines, replaces them in the
+Exports quantizable modules to TensorRT engines, replaces them in the
 BEVFusion pipeline, and runs full NDS evaluation on nuScenes.
 
-Modules exported:
-  1. fuser        (ConvFuser)           — cam_bev+lidar_bev → fused_bev
-  2. dec_backbone  (SECOND)             — fused_bev → multi-scale features
-  3. dec_neck      (SECONDFPN)          — multi-scale → concatenated feature
-  4. camera_neck   (GeneralizedLSSFPN)  — multi-scale image → fused image features
+Modules exported (auto-detected):
+  Always:
+    1. fuser        (ConvFuser)           — cam_bev+lidar_bev → fused_bev
+    2. dec_backbone  (SECOND)             — fused_bev → multi-scale features
+    3. dec_neck      (SECONDFPN)          — multi-scale → concatenated feature
+    4. camera_neck   (GeneralizedLSSFPN)  — multi-scale image → fused image features
+  If camera backbone is ResNet (not SwinTransformer):
+    5. camera_backbone (ResNet)           — images → multi-scale features
 
 Usage:
   python tools/trt_eval_hybrid_all.py \\
@@ -32,6 +35,31 @@ except Exception:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Pre-load shared libraries on Linux to prevent ImportError when mmcv
+# CUDA extensions try to dlopen libtorch_cuda_cu.so / libnvinfer.so.
+if sys.platform.startswith('linux'):
+    import ctypes
+    _torch_lib = os.path.join(os.path.dirname(torch.__file__), 'lib')
+    for _f in sorted(os.listdir(_torch_lib)):
+        if 'cuda' in _f and _f.endswith('.so'):
+            try:
+                ctypes.CDLL(os.path.join(_torch_lib, _f), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+    try:
+        import importlib as _il
+        _trt_lib_dir = _il.import_module('tensorrt_libs').__path__[0]
+        for _f in sorted(os.listdir(_trt_lib_dir)):
+            if _f.endswith('.so'):
+                try:
+                    ctypes.CDLL(os.path.join(_trt_lib_dir, _f),
+                                mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+    except ImportError:
+        pass
+
 from torchpack.utils.config import configs
 from mmcv import Config
 from mmcv.parallel import MMDataParallel
@@ -111,6 +139,28 @@ class CameraNeckForExport(nn.Module):
             laterals[i] = self.lateral_convs[i](laterals[i])
             laterals[i] = self.fpn_convs[i](laterals[i])
         return laterals[0], laterals[1]
+
+
+class ResNetForExport(nn.Module):
+    """ResNet backbone: image tensor → multi-scale features.
+    Explicitly unrolls the forward pass for clean ONNX export.
+    Assumes out_indices=[1,2,3] (3 outputs)."""
+    def __init__(self, backbone):
+        super().__init__()
+        bb = copy.deepcopy(backbone)
+        self.stem = nn.Sequential(bb.conv1, bb.norm1, bb.relu, bb.maxpool)
+        self.layer1 = getattr(bb, bb.res_layers[0])
+        self.layer2 = getattr(bb, bb.res_layers[1])
+        self.layer3 = getattr(bb, bb.res_layers[2])
+        self.layer4 = getattr(bb, bb.res_layers[3])
+
+    def forward(self, x):
+        x = self.stem(x)
+        c2 = self.layer1(x)
+        c3 = self.layer2(c2)
+        c4 = self.layer3(c3)
+        c5 = self.layer4(c4)
+        return c3, c4, c5
 
 
 # =====================================================================
@@ -204,6 +254,21 @@ class TRTCameraNeck(TRTBase):
             'cam0': c0, 'cam1': c1, 'cam2': c2, 'out0': o0, 'out1': o1,
         })
         return (o0.clone(), o1.clone())
+
+
+class TRTCameraBackbone(TRTBase):
+    """Drop-in for ResNet backbone: tensor → list of 3 feature tensors."""
+    def __init__(self, engine_path, out_shapes):
+        super().__init__(engine_path)
+        self.out_shapes = out_shapes  # [shape0, shape1, shape2]
+
+    def forward(self, x):
+        x = x.contiguous().float()
+        o0 = self._buf('feat0', self.out_shapes[0], x.device)
+        o1 = self._buf('feat1', self.out_shapes[1], x.device)
+        o2 = self._buf('feat2', self.out_shapes[2], x.device)
+        self._exec({'image': x, 'feat0': o0, 'feat1': o1, 'feat2': o2})
+        return [o0.clone(), o1.clone(), o2.clone()]
 
 
 # =====================================================================
@@ -300,7 +365,7 @@ def build_engine(onnx_path, precision, calib=None):
 #  Main
 # =====================================================================
 
-MODULE_NAMES = ['camera_neck', 'fuser', 'dec_backbone', 'dec_neck']
+BASE_MODULE_NAMES = ['camera_neck', 'fuser', 'dec_backbone', 'dec_neck']
 
 
 def parse_args():
@@ -314,6 +379,8 @@ def parse_args():
     p.add_argument('--calib-samples', type=int, default=50)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--skip-baseline', action='store_true')
+    p.add_argument('--out-dir', type=str, default='runs/trt_hybrid_all',
+                   help='output directory for ONNX and TRT engines')
     return p.parse_args()
 
 
@@ -322,7 +389,7 @@ def main():
     torch.backends.cudnn.benchmark = True
     set_random_seed(args.seed, deterministic=True)
 
-    out_dir = 'runs/trt_hybrid_all'
+    out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
     # ==================== 1. Load model ====================
@@ -354,8 +421,19 @@ def main():
     model.eval()
     print(f'\n[1/7] Model loaded: {args.checkpoint}')
 
+    # Detect camera backbone type — ResNet is TRT-exportable
+    cam_bb_type = cfg.model.encoders.camera.backbone.type
+    include_cam_backbone = cam_bb_type in ('ResNet',)
+    MODULE_NAMES = list(BASE_MODULE_NAMES)
+    if include_cam_backbone:
+        MODULE_NAMES.insert(0, 'camera_backbone')
+    n_modules = len(MODULE_NAMES)
+    print(f'  Camera backbone: {cam_bb_type}'
+          f' → {"included" if include_cam_backbone else "skipped"}'
+          f' ({n_modules} modules total)')
+
     # ==================== 2. Export ONNX ====================
-    print(f'\n[2/7] Exporting ONNX for 4 modules...')
+    print(f'\n[2/7] Exporting ONNX for {n_modules} modules...')
 
     # We need actual shapes — run one sample to collect them via hooks
     shapes = {}
@@ -384,6 +462,9 @@ def main():
             shape_hook('dec_backbone')),
         model.decoder["neck"].register_forward_hook(shape_hook('dec_neck')),
     ]
+    if include_cam_backbone:
+        hooks.append(model.encoders["camera"]["backbone"].register_forward_hook(
+            shape_hook('camera_backbone')))
 
     model_tmp = MMDataParallel(model, device_ids=[0])
     with torch.no_grad():
@@ -456,6 +537,19 @@ def main():
     onnx_paths['camera_neck'] = p
     del w
 
+    # Camera backbone (ResNet only)
+    if include_cam_backbone:
+        w = ResNetForExport(model.encoders["camera"]["backbone"]).eval().cpu()
+        p = os.path.join(out_dir, 'camera_backbone.onnx')
+        torch.onnx.export(
+            w,
+            (torch.randn(*shapes['camera_backbone']['in'][0]),),
+            p, input_names=['image'],
+            output_names=['feat0', 'feat1', 'feat2'], opset_version=13,
+            do_constant_folding=True)
+        onnx_paths['camera_backbone'] = p
+        del w
+
     print('  ONNX export complete.')
 
     # Verify model params still on CUDA
@@ -488,6 +582,9 @@ def main():
             model.decoder["neck"].register_forward_hook(
                 calib_hook('dec_neck')),
         ]
+        if include_cam_backbone:
+            hooks.append(model.encoders["camera"]["backbone"].register_forward_hook(
+                calib_hook('camera_backbone')))
 
         model_calib = MMDataParallel(model, device_ids=[0])
         with torch.no_grad():
@@ -545,6 +642,7 @@ def main():
                 'dec_backbone': ['bev_feat'],
                 'dec_neck': ['feat0', 'feat1'],
                 'camera_neck': ['cam0', 'cam1', 'cam2'],
+                'camera_backbone': ['image'],
             }[name]
             calib = make_calibrator(calib_data[name], in_names, cache)
 
@@ -592,6 +690,9 @@ def main():
             ref_hook('dec_backbone')),
         model.decoder["neck"].register_forward_hook(ref_hook('dec_neck')),
     ]
+    if include_cam_backbone:
+        hooks.append(model.encoders["camera"]["backbone"].register_forward_hook(
+            ref_hook('camera_backbone')))
 
     model_ref = MMDataParallel(model, device_ids=[0])
     with torch.no_grad():
@@ -616,13 +717,17 @@ def main():
                                       [tuple(s) for s in
                                        shapes['camera_neck']['out']]),
     }
+    if include_cam_backbone:
+        trt_wrappers_test['camera_backbone'] = TRTCameraBackbone(
+            engine_paths['camera_backbone'],
+            [tuple(s) for s in shapes['camera_backbone']['out']])
 
     with torch.no_grad():
         for name in MODULE_NAMES:
             ref = ref_data[name]
             trt_mod = trt_wrappers_test[name]
-            # dec_backbone takes a single tensor; others take list/tuple
-            if name == 'dec_backbone':
+            # dec_backbone and camera_backbone take a single tensor
+            if name in ('dec_backbone', 'camera_backbone'):
                 trt_out = trt_mod(ref['in'][0])
             else:
                 trt_out = trt_mod(ref['in'])
@@ -639,10 +744,14 @@ def main():
     torch.cuda.empty_cache()
 
     # ==================== 7. Replace & evaluate ====================
-    print(f'\n[7/7] Replacing 4 modules with TRT {args.precision.upper()}'
+    print(f'\n[7/7] Replacing {n_modules} modules with TRT {args.precision.upper()}'
           f' engines...')
 
     # Create TRT wrappers with correct output shapes
+    if include_cam_backbone:
+        model.encoders["camera"]["backbone"] = TRTCameraBackbone(
+            engine_paths['camera_backbone'],
+            [tuple(s) for s in shapes['camera_backbone']['out']])
     model.encoders["camera"]["neck"] = TRTCameraNeck(
         engine_paths['camera_neck'],
         [tuple(s) for s in shapes['camera_neck']['out']])
@@ -691,7 +800,7 @@ def main():
     print('=' * 60)
     if not args.skip_baseline:
         print(f'  FP32 Baseline:          NDS={nds_fp32}, mAP={map_fp32}')
-    print(f'  TRT {args.precision.upper():5s} (4 modules): '
+    print(f'  TRT {args.precision.upper():5s} ({n_modules} modules): '
           f'NDS={nds_trt}, mAP={map_trt}')
     if not args.skip_baseline and isinstance(nds_fp32, float) \
             and isinstance(nds_trt, float):
@@ -701,7 +810,7 @@ def main():
     fp32_pth_mb = os.path.getsize(args.checkpoint) / (1024 * 1024)
     print(f'  FP32 .pth size:         {fp32_pth_mb:.1f} MB')
     if total_kb > 0:
-        print(f'  Compression (4 modules): {fp32_pth_mb / (total_kb/1024):.1f}x')
+        print(f'  Compression ({n_modules} modules): {fp32_pth_mb / (total_kb/1024):.1f}x')
     print('=' * 60)
 
 

@@ -52,7 +52,7 @@ class DefaultFormatBundle3D:
             assert isinstance(results["points"], BasePoints)
             results["points"] = DC(results["points"].tensor)
 
-        if "radar" in results:
+        if "radar" in results and hasattr(results["radar"], "tensor"):
             results["radar"] = DC(results["radar"].tensor)
 
         for key in ["voxels", "coors", "voxel_centers", "num_points"]:
