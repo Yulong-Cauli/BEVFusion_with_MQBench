@@ -378,11 +378,18 @@ def main():
     # ------------------------------------------------------------------
     # 1. 构建模型
     # ------------------------------------------------------------------
-    cfg = Config.fromfile(args.config)
-    recursive_eval(cfg)
+    configs.load(args.config, recursive=True)
+    cfg = Config(recursive_eval(configs), filename=args.config)
     logger = get_root_logger()
 
-    model = build_model(cfg.model)
+    # 禁止 build_model 触发网络下载（SwinT pretrained 等）
+    cfg.model.pretrained = None
+    if hasattr(cfg.model, "encoders"):
+        for enc_cfg in cfg.model.encoders.values() if hasattr(cfg.model.encoders, "values") else []:
+            if hasattr(enc_cfg, "backbone") and hasattr(enc_cfg.backbone, "init_cfg"):
+                enc_cfg.backbone.init_cfg = None
+
+    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
     load_checkpoint(model, args.checkpoint, map_location="cpu", strict=False)
     model.eval()
 
@@ -393,7 +400,7 @@ def main():
     data_loader = build_dataloader(
         dataset,
         samples_per_gpu=args.batch_size,
-        workers_per_gpu=2,
+        workers_per_gpu=0,   # 0 = main-process only，避免 Windows 多进程 pickle 问题
         num_gpus=1,
         dist=False,
         shuffle=False,
