@@ -354,3 +354,110 @@ scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBenc
 cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
 tar xzf server_lwc_results.tar.gz
 ```
+
+---
+
+## Round 3：校准集多样性实验（calib-shuffle + 512 batch）
+
+> **目标**：验证 `shuffle=True + 512 batch` 的校准策略是否改善 8/8 和 6/8 的量化精度  
+> **动机**：旧 `shuffle=False` 仅取前 128 帧，约等于前 3~4 个场景（~2% 场景覆盖率）；  
+>   改为 `shuffle=True + 512 batch` 可均匀覆盖全部 ~150 个场景，激活值分布更具代表性  
+> **对照**：用 6/8 作为控制变量——若 6/8 NDS 不变，说明改善完全来自 vtransform/lidar 校准
+
+### Round 3 Step 0：打包上传
+
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+cd D:\Research\Replication\BEVFusion_with_MQBench
+git archive HEAD --format=tar.gz -o code_update.tar.gz -- tools/quant_ptq_minmax.py
+
+scp code_update.tar.gz yellowstone@10.129.51.101:/tmp/
+
+ssh yellowstone@10.129.51.101 `
+    "cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench && tar xzf /tmp/code_update.tar.gz && rm /tmp/code_update.tar.gz && echo 'Upload OK'"
+```
+
+### Round 3 Step 1：实验清单（2 张 3090 并行）
+
+| GPU# | 实验 | 关键参数 | 对照基线 |
+|------|------|---------|---------|
+| GPU#0 | PTQ 8/8 + shuffle + 512 | `--calib-batches 512 --calib-shuffle` | 旧 8/8 NDS=0.4562 |
+| GPU#1 | PTQ 6/8 + shuffle + 512 | `--calib-batches 512 --calib-shuffle --skip-modules camera/vtransform lidar/backbone` | 旧 6/8 NDS=0.7010 |
+
+> GPU#2 = A100（共享，不使用）；GPU#3/4 空闲可备用
+
+### Round 3 Step 2：环境初始化（每个 tmux 窗口）
+
+```bash
+conda activate bevfusion_mqbench
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+export LD_LIBRARY_PATH=$(python -c "import torch,os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"):$LD_LIBRARY_PATH
+```
+
+---
+
+#### GPU#0 — PTQ 8/8 + shuffle + 512 batch
+
+```bash
+tmux attach -t gpu0
+# ↑ 先执行上面的环境初始化 ↑
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --run-dir runs/server_ptq_8of8_calib512s \
+    --calib-batches 512 \
+    --calib-shuffle \
+    2>&1 | tee logs/results_server_ptq_8of8_calib512_shuffle.log
+# Ctrl+B D 断开
+```
+
+---
+
+#### GPU#1 — PTQ 6/8 + shuffle + 512 batch（对照组）
+
+```bash
+tmux attach -t gpu1
+# ↑ 先执行上面的环境初始化 ↑
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --run-dir runs/server_ptq_6of8_calib512s \
+    --skip-modules camera/vtransform lidar/backbone \
+    --calib-batches 512 \
+    --calib-shuffle \
+    2>&1 | tee logs/results_server_ptq_6of8_calib512_shuffle.log
+# Ctrl+B D 断开
+```
+
+---
+
+### Round 3 Step 3：传回结果
+
+```bash
+# 在服务器执行
+tar czf server_calib512_results.tar.gz \
+    logs/results_server_ptq_8of8_calib512_shuffle.log \
+    logs/results_server_ptq_6of8_calib512_shuffle.log
+ls -lh server_calib512_results.tar.gz
+```
+
+**本地拉取：**
+
+```powershell
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/server_calib512_results.tar.gz `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\
+
+cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
+tar xzf server_calib512_results.tar.gz
+```
+
+### Round 3 结果解读指引
+
+- **若 6/8 不变（仍 ~0.7010）+ 8/8 有改善**：改善确实来自 vtransform/lidar 场景多样性
+- **若 6/8 也变好**：说明 neck/fuser/decoder 的校准也受益（概率较低，因为这些模块原本已近无损）
+- **若两者都不变**：校准样本量不是瓶颈，损失根本原因是 INT8 精度不足以表示深度概率分布
+
