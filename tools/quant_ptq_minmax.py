@@ -484,6 +484,165 @@ def apply_selective_ptq(model, backend_type, logger, skip_modules=None):
 
 
 # ============================================================================
+# Learnable Weight Clipping (LWC)
+# —— 对稀疏卷积权重学习最优截断范围，参考 OmniQuant (ICLR 2024)
+# ============================================================================
+
+def _round_ste(x: torch.Tensor) -> torch.Tensor:
+    """Straight-Through Estimator for rounding: forward=round, backward=identity."""
+    return (x.round() - x).detach() + x
+
+
+def _fake_quant_weight(w: torch.Tensor, clip_min: torch.Tensor, clip_max: torch.Tensor,
+                        ch_axis: int = 4, qmin: int = -127, qmax: int = 127) -> torch.Tensor:
+    """可微 per-channel fake quantization with learnable clipping.
+
+    Args:
+        w: 原始权重 [K,K,K,C_in,C_out]
+        clip_min: per-channel 下界 [C_out]（负值）
+        clip_max: per-channel 上界 [C_out]（正值）
+        ch_axis: 输出通道维度（稀疏卷积=4）
+        qmin, qmax: 量化范围（INT8 对称 = [-127, 127]）
+
+    Returns:
+        w_dequant: 经过 clamp → scale → round(STE) → dequant 的权重
+    """
+    # 把 clip_min/clip_max reshape 为可广播的形状
+    ndim = w.ndim
+    shape = [1] * ndim
+    shape[ch_axis] = -1
+    cmin = clip_min.view(shape)
+    cmax = clip_max.view(shape)
+
+    # clamp → compute scale → quantize → dequantize
+    w_clamped = w.clamp(cmin, cmax)
+    abs_max = torch.max(cmax.abs(), cmin.abs())
+    scale = abs_max / qmax  # per-channel scale
+    scale = scale.clamp(min=1e-8)
+
+    w_int = _round_ste(w_clamped / scale)
+    w_int = w_int.clamp(qmin, qmax)
+    w_dequant = w_int * scale
+    return w_dequant
+
+
+def optimize_lwc_sparse(model, logger,
+                        lr: float = 0.01,
+                        num_iters: int = 500,
+                        init_value: float = 4.0):
+    """对模型中所有 _QuantizedSparseConv 的权重学习最优截断范围 (LWC)。
+
+    原理（OmniQuant LWC, Method A — Weight Reconstruction）：
+      对每个稀疏卷积层的权重 W，学习 per-channel 的截断参数 γ, δ：
+        clip_max = sigmoid(γ) · max_W     (per output channel)
+        clip_min = sigmoid(δ) · min_W     (per output channel)
+      优化目标：min_{γ,δ} MSE(W, FakeQuant(clamp(W, clip_min, clip_max)))
+      梯度通过 STE (Straight-Through Estimator) 穿过 round 操作。
+
+    优化完成后，将截断后的权重写回原始 conv.weight.data，使得后续
+    MinMax 校准器看到的权重已无离群点，自然得到更合理的 scale。
+
+    Args:
+        model: 已经过 apply_selective_ptq 的模型（含 _QuantizedSparseConv）
+        logger: 日志记录器
+        lr: Adam 学习率 (default: 0.01, 与 OmniQuant 一致)
+        num_iters: 每层优化迭代次数 (default: 500)
+        init_value: γ/δ 初始值 (default: 4.0, sigmoid(4)≈0.982)
+    """
+    inner = model.module if hasattr(model, "module") else model
+    sigmoid = nn.Sigmoid()
+
+    lwc_layers = []
+    for name, mod in inner.named_modules():
+        if isinstance(mod, _QuantizedSparseConv):
+            lwc_layers.append((name, mod))
+
+    if not lwc_layers:
+        logger.warning("LWC: 未找到 _QuantizedSparseConv 层，跳过。")
+        return
+
+    logger.info(f"")
+    logger.info(f"╔══════════════════════════════════════════════════════════════╗")
+    logger.info(f"║   LWC — Learnable Weight Clipping (稀疏卷积权重截断优化)     ║")
+    logger.info(f"╠══════════════════════════════════════════════════════════════╣")
+    logger.info(f"║  目标层数: {len(lwc_layers):>3d}  │  lr={lr}  │  iters={num_iters}  │  init={init_value}")
+    logger.info(f"╚══════════════════════════════════════════════════════════════╝")
+
+    ch_axis = 4  # 稀疏卷积权重 [K,K,K,C_in,C_out] 的输出通道维度
+    total_clipped = 0
+    total_params = 0
+
+    for layer_idx, (name, qconv) in enumerate(lwc_layers):
+        W = qconv.conv.weight.data  # [K,K,K,C_in,C_out]
+        C_out = W.shape[ch_axis]
+        total_params += W.numel()
+
+        # 统计每个输出通道的 min/max
+        # 将非 ch_axis 维度 flatten，得到 [rest, C_out]
+        perm = list(range(W.ndim))
+        perm.remove(ch_axis)
+        perm.append(ch_axis)
+        W_perm = W.permute(*perm).contiguous().view(-1, C_out)  # [K³·C_in, C_out]
+        min_W = W_perm.min(dim=0).values.detach()  # [C_out], 负值
+        max_W = W_perm.max(dim=0).values.detach()  # [C_out], 正值
+
+        # 初始化可学习截断参数
+        gamma = nn.Parameter(torch.full((C_out,), init_value, device=W.device))  # 上界
+        delta = nn.Parameter(torch.full((C_out,), init_value, device=W.device))  # 下界
+
+        optimizer = torch.optim.Adam([gamma, delta], lr=lr)
+        W_target = W.detach().clone()  # 优化目标：原始 FP32 权重
+
+        best_loss = float("inf")
+        best_gamma = gamma.data.clone()
+        best_delta = delta.data.clone()
+
+        for it in range(num_iters):
+            optimizer.zero_grad()
+
+            clip_max = sigmoid(gamma) * max_W  # [C_out]
+            clip_min = sigmoid(delta) * min_W  # [C_out]
+
+            W_q = _fake_quant_weight(W_target, clip_min, clip_max, ch_axis=ch_axis)
+            loss = torch.nn.functional.mse_loss(W_q, W_target)
+            loss.backward()
+            optimizer.step()
+
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                best_gamma = gamma.data.clone()
+                best_delta = delta.data.clone()
+
+        # 用最优截断参数截断权重（原地修改）
+        with torch.no_grad():
+            clip_max = sigmoid(best_gamma) * max_W
+            clip_min = sigmoid(best_delta) * min_W
+
+            # 计算截断比例
+            clip_ratio_up = sigmoid(best_gamma).mean().item()
+            clip_ratio_lo = sigmoid(best_delta).mean().item()
+            n_clipped = ((W < clip_min.view(1, 1, 1, 1, -1)) |
+                         (W > clip_max.view(1, 1, 1, 1, -1))).sum().item()
+            total_clipped += n_clipped
+
+            # 原地截断权重 → 使后续 MinMax Observer 看到更紧凑的范围
+            for c in range(C_out):
+                W[..., c].clamp_(clip_min[c].item(), clip_max[c].item())
+
+        logger.info(
+            f"  [{layer_idx + 1:>2d}/{len(lwc_layers)}] {name:<45s} "
+            f"loss={best_loss:.6f}  clip↑={clip_ratio_up:.4f}  clip↓={clip_ratio_lo:.4f}  "
+            f"clipped={n_clipped:>6d}/{W.numel()}"
+        )
+
+    clip_pct = total_clipped / max(total_params, 1) * 100
+    logger.info(f"")
+    logger.info(f"LWC 优化完成：共截断 {total_clipped:,} / {total_params:,} 个权重元素 ({clip_pct:.2f}%)")
+    logger.info(f"截断后的权重已写回模型，后续 MinMax 校准将基于截断后的权重范围。")
+    logger.info(f"")
+
+
+# ============================================================================
 # 校准阶段
 # ============================================================================
 
@@ -872,6 +1031,24 @@ def main():
         default=[],
         help="display names of modules to skip (e.g. --skip-modules camera/vtransform lidar/backbone)",
     )
+    # LWC (Learnable Weight Clipping) 参数
+    parser.add_argument(
+        "--lwc",
+        action="store_true",
+        help="enable Learnable Weight Clipping for sparse conv weights (OmniQuant-style)",
+    )
+    parser.add_argument(
+        "--lwc-lr",
+        type=float,
+        default=0.01,
+        help="LWC learning rate (default: 0.01)",
+    )
+    parser.add_argument(
+        "--lwc-iters",
+        type=int,
+        default=500,
+        help="LWC optimization iterations per layer (default: 500)",
+    )
     args, opts = parser.parse_known_args()
 
     configs.load(args.config, recursive=True)
@@ -945,6 +1122,17 @@ def main():
     logger.info("模型已移动到 GPU（MMDataParallel）。")
 
     # ------------------------------------------------------------------
+    # Step 2.5 (可选): LWC — Learnable Weight Clipping
+    # ------------------------------------------------------------------
+    if args.lwc:
+        logger.info("启用 LWC (Learnable Weight Clipping)，优化稀疏卷积权重截断范围...")
+        optimize_lwc_sparse(
+            model, logger,
+            lr=args.lwc_lr,
+            num_iters=args.lwc_iters,
+        )
+
+    # ------------------------------------------------------------------
     # ★ 量化结果摘要（校准开始前，请确认后继续）
     # ------------------------------------------------------------------
     _EXPECTED_QUANT = {k for k, _ in _QUANTIZABLE_SUBMODULE_KEYS} | {"heads/object"}
@@ -1002,21 +1190,21 @@ def main():
     # ------------------------------------------------------------------
     save_path = os.path.join(cfg.run_dir, "ptq_minmax_model.pth")
     inner_model = model.module if hasattr(model, "module") else model
+    meta = {
+        "ptq_method": "MinMax" + ("+LWC" if args.lwc else ""),
+        "backend": "TensorRT",
+        "quantized_modules": [k for k, _ in _QUANTIZABLE_SUBMODULE_KEYS]
+        + ["heads/*"],
+        "skipped_modules": [
+            "camera/vtransform",
+            "lidar/voxelize",
+            "lidar/backbone (SparseEncoder)",
+        ],
+    }
+    if args.lwc:
+        meta["lwc"] = {"lr": args.lwc_lr, "iters": args.lwc_iters}
     torch.save(
-        {
-            "state_dict": inner_model.state_dict(),
-            "meta": {
-                "ptq_method": "MinMax",
-                "backend": "TensorRT",
-                "quantized_modules": [k for k, _ in _QUANTIZABLE_SUBMODULE_KEYS]
-                + ["heads/*"],
-                "skipped_modules": [
-                    "camera/vtransform",
-                    "lidar/voxelize",
-                    "lidar/backbone (SparseEncoder)",
-                ],
-            },
-        },
+        {"state_dict": inner_model.state_dict(), "meta": meta},
         save_path,
     )
     logger.info(f"PTQ 量化模型已保存至: {save_path}")
