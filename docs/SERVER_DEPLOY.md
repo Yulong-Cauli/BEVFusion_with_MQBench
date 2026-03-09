@@ -461,3 +461,78 @@ tar xzf server_calib512_results.tar.gz
 - **若 6/8 也变好**：说明 neck/fuser/decoder 的校准也受益（概率较低，因为这些模块原本已近无损）
 - **若两者都不变**：校准样本量不是瓶颈，损失根本原因是 INT8 精度不足以表示深度概率分布
 
+
+---
+
+#### GPU#3 — PTQ 8/8 + shuffle + 512 batch + LWC（核心实验）
+
+> LWC 用校准数据的 MSE 来优化截断比率，校准数据越多样，优化目标越准确。
+
+```bash
+tmux attach -t gpu3
+# ↑ 先执行上面的环境初始化 ↑
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --run-dir runs/server_ptq_8of8_lwc_calib512s \
+    --calib-batches 512 \
+    --calib-shuffle \
+    --lwc \
+    2>&1 | tee logs/results_server_ptq_8of8_lwc_calib512_shuffle.log
+# Ctrl+B D 断开
+```
+
+---
+
+#### GPU#4 — PTQ 8/8 + shuffle + 512 batch + LWC + MSEObserver（组合实验）
+
+```bash
+tmux attach -t gpu4
+# ↑ 先执行上面的环境初始化 ↑
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --run-dir runs/server_ptq_8of8_lwc_mse_calib512s \
+    --calib-batches 512 \
+    --calib-shuffle \
+    --lwc \
+    --act-observer mse \
+    2>&1 | tee logs/results_server_ptq_8of8_lwc_mse_calib512_shuffle.log
+# Ctrl+B D 断开
+```
+
+### Round 3 Step 3：传回结果
+
+```bash
+# 在服务器执行（包含本 round 全部4个日志）
+tar czf server_calib512_results.tar.gz \
+    logs/results_server_ptq_8of8_calib512_shuffle.log \
+    logs/results_server_ptq_6of8_calib512_shuffle.log \
+    logs/results_server_ptq_8of8_lwc_calib512_shuffle.log \
+    logs/results_server_ptq_8of8_lwc_mse_calib512_shuffle.log
+ls -lh server_calib512_results.tar.gz
+```
+
+**本地拉取：**
+
+```powershell
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/server_calib512_results.tar.gz `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\
+
+cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
+tar xzf server_calib512_results.tar.gz
+```
+
+### Round 3 结果解读指引
+
+| 对比 | 说明 |
+|------|------|
+| 8/8 shuffle512 vs 旧 8/8 (0.4562) | 校准多样性的独立效果 |
+| 6/8 shuffle512 vs 旧 6/8 (0.7010) | 对照：6/8 本来已近无损，应基本不变 |
+| 8/8 LWC+shuffle512 vs 旧 LWC (0.4545) | shuffle 对 LWC 优化目标的影响（核心） |
+| 8/8 LWC+MSE+shuffle512 vs 旧 LWC+MSE (0.4526) | 组合策略+好校准集的上限 |
+
