@@ -1068,6 +1068,13 @@ def main():
              "mse: MSE-optimal range (recommended for heavy-tailed distributions); "
              "ema_quantile: percentile-based clipping (threshold=0.99999)",
     )
+    parser.add_argument(
+        "--calib-shuffle",
+        action="store_true",
+        help="shuffle calibration data for better scene diversity (default: False, sequential). "
+             "Recommended when --calib-batches < total_val_size: sequential order means only "
+             "the first N scenes are used; shuffle ensures coverage across all scenes.",
+    )
     args, opts = parser.parse_known_args()
 
     configs.load(args.config, recursive=True)
@@ -1113,12 +1120,18 @@ def main():
     calib_cfg = cfg.data.val.copy()
     calib_cfg.test_mode = True
     calib_dataset = build_dataset(calib_cfg)
+    calib_shuffle = args.calib_shuffle
     calib_loader = build_dataloader(
         calib_dataset,
         samples_per_gpu=1,
         workers_per_gpu=cfg.data.workers_per_gpu,
         dist=False,
-        shuffle=False,
+        shuffle=calib_shuffle,
+    )
+    logger.info(
+        f"校准数据集构建完成：共 {len(calib_dataset)} 帧，"
+        f"将使用前 {args.calib_batches} 个 batch，"
+        f"{'随机采样（shuffle=True）' if calib_shuffle else '顺序采样（shuffle=False，仅覆盖前几个场景）'}"
     )
 
     if not args.no_eval:
@@ -1181,6 +1194,8 @@ def main():
     logger.info(f"║  主动跳过: {', '.join(args.skip_modules) if args.skip_modules else '(无)'}")
     logger.info(f"║  覆盖率  : {coverage_pct:.0f}%  ({len(quant_success)}/{total_possible} 个可量化模块)")
     logger.info(f"║  稀疏激活: {act_obs_name}")
+    calib_desc = f"{args.calib_batches} batch, {'shuffle=True（多场景）' if args.calib_shuffle else 'shuffle=False（顺序，仅前几场景）'}"
+    logger.info(f"║  校准配置: {calib_desc}")
     if args.lwc:
         logger.info(f"║  LWC     : ON (lr={args.lwc_lr}, iters={args.lwc_iters})")
     if quant_failed:
@@ -1203,7 +1218,7 @@ def main():
     # ------------------------------------------------------------------
     # Step 3: MinMax 校准
     # ------------------------------------------------------------------
-    logger.info(f"MinMax 校准阶段：{args.calib_batches} 个 batch")
+    logger.info(f"MinMax 校准阶段：{args.calib_batches} 个 batch，{'随机采样' if args.calib_shuffle else '顺序采样（仅前几个场景）'}")
     run_calibration(model, calib_loader, num_batches=args.calib_batches, logger=logger)
 
     # ------------------------------------------------------------------
