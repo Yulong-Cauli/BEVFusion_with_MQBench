@@ -1,4 +1,4 @@
-# BEVFusion 混合精度量化与 TensorRT 部署报告
+﻿# BEVFusion 混合精度量化与 TensorRT 部署报告
 
 > **项目**：BEVFusion + MQBench 训练后量化（PTQ）  
 > **日期**：2026-02  
@@ -961,6 +961,61 @@ w_params['quant_min'] = -127  # TensorRT 标准对称范围 [-127, 127]
 
 修复后，服务器上三条量化路径全部正常工作，8/8 模块均成功量化，消融实验结果见 §9.7.3。
 
+### 9.8 精细化校准策略实验：LWC + MSEObserver（2026-03-09）
+
+#### 9.8.1 动机与设计
+
+全模块消融实验（§9.7.3）揭示了 lidar/backbone 量化损失最大（−0.132 NDS），且权重分布诊断
+（	ools/diag_lidar_distribution.py）发现 SparseEncoder 各层权重范围利用率仅 25–78%（均值 48%），
+激活值最大/中位比最高达 15.7。据此设计了两种精细化校准策略：
+
+**LWC（Learnable Weight Clipping）**——参考 OmniQuant（ICLR 2024）：
+- 为 lidar/backbone 每个稀疏卷积层引入可学习标量参数 weight_clip_ratio ∈ (0,1]
+- 以最小化 FakeQuant 后的权重重建 MSE 为目标，用 Adam 优化器迭代更新截断比率
+- 收敛后用优化后的 clip_ratio × max(|W|) 替换 MinMax 的动态 range
+
+**MSEObserver**——激活 observer 替换：
+- 将 lidar/backbone 激活量化的 observer 从 EMAMinMaxObserver 替换为 MSEObserver
+- MSEObserver 通过穷举搜索最小化校准数据上的均方误差来确定激活 range（而非直接取 max）
+
+#### 9.8.2 实验结果（完整验证集，6019 帧）
+
+| 配置 | 权重策略 | 激活策略 | NDS | mAP | ΔNDS vs 8/8基线 |
+|------|---------|---------|-----|-----|----------------|
+| PTQ 8/8 MinMax 基线 | EMAMinMax | EMAMinMax | 0.4562 | 0.3536 | — |
+| + LWC only | **LWC** | EMAMinMax | 0.4545 | 0.3540 | −0.0017 |
+| + MSEObserver only | EMAMinMax | **MSEObserver** | 0.4560 | 0.3522 | −0.0002 |
+| + LWC + MSEObserver | **LWC** | **MSEObserver** | 0.4526 | 0.3519 | −0.0036 |
+| + LWC + EMAQuantile | **LWC** | **EMAQuantile** | 0.4540 | 0.3535 | −0.0022 |
+
+**LWC 运行统计**：21 层全部优化，截断比率收敛于 0.982–0.990，实际截断权重元素 3,003/2,691,696（**0.11%**），
+各层重建 MSE 损失为 1e-5 至 4e-5 量级。
+
+#### 9.8.3 结果分析：为什么精细化策略无效？
+
+**LWC 和 MSEObserver 均未能改善 NDS（差异在 ±0.004 以内，属于校准随机性范围）。**
+这不是实现错误，而是揭示了下列深层原因。
+
+**瓶颈定位**——两轮消融实验的完整误差归因：
+
+| 扰动来源 | ΔNDS |
+|---------|------|
+| 仅 vtransform 量化（7/8） | −0.0890 |
+| 仅 lidar/backbone 量化（7/8） | −0.1318 |
+| 线性叠加预测（8/8） | −0.2208 |
+| 实际 8/8 全量化 | **−0.2507（比线性叠加还差 −0.030）** |
+
+实际 8/8 比两路单独损失之和还差 **−0.030**，存在**非线性协同劣化效应**：
+vtransform 破坏了 camera BEV 特征，lidar 路径同时量化后，fuser 合并两路劣化特征，误差在融合层放大。
+
+LWC **0.11% 截断率**说明 lidar 权重并没有功能性离群点：诊断显示的 range 利用率低是因为权重能量集中（窄峰），
+而非存在危害量化的真正离群值——MinMax 本已找到了较优 range，优化空间极小。
+
+**结论**：若要改善 8/8 精度，需要为 vtransform 的 bev_pool 输出设计专属量化方案（如混合精度或固定 range），
+而不是在 lidar/backbone 侧做更精细的校准。6/8 方案（NDS −0.0059）仍是最优工程选择。
+
+
+
 ---
 
 ## 10. 与 NVIDIA CUDA-BEVFusion 的对比
@@ -1057,10 +1112,20 @@ NVIDIA 官方提供了 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_A
    
    **进一步探索**：ResNet-50 FP32 NDS（0.4989）显著低于 SwinT（0.7069），主因是仅训练 6 epochs（训练 loss 仍以 7.6%/epoch 速率下降，远未收敛）。继续训练至 20 epochs 预计可显著提升 NDS。
 
-4. **更先进的校准策略**  
-   当前使用最朴素的 MinMax 校准。可尝试：
-   - **Histogram / Percentile 校准**：裁剪掉极端值，可能改善 INT8 精度
-   - **AdaRound**（MQBench 支持）：学习最优的 round-to-nearest 策略
+4. ~~**更先进的校准策略**~~  ✅ **已实验（LWC + MSEObserver，2026-03-09，详见 §9.8）**
+
+   已为 lidar/backbone（稀疏卷积）实现并评估了两种精细化校准策略：
+   - **LWC（Learnable Weight Clipping）**：受 OmniQuant（ICLR 2024）启发，可学习权重截断参数；
+     21 层优化后截断 0.11% 权重元素，重建 MSE 极低（1e-5），NDS 变化 −0.0017（无显著改善）
+   - **MSEObserver**：MSE 最优激活 range 搜索，NDS 变化 −0.0002（无显著改善）
+
+   **关键发现**：lidar 侧的精细化校准对 NDS 无效，根本原因是 vtransform 量化（−0.089 NDS）
+   才是 8/8 全量化的主要瓶颈，改善 lidar 校准无法补偿融合层的协同误差。**6/8（NDS 0.7010，
+   −0.83%）仍是最优配置**。
+
+   进一步改善方向：
+   - **vtransform 专属量化策略**：为 bev_pool 输出设计固定 range 或混合精度方案
+   - **AdaRound**（MQBench 支持）：基于任务损失的权重优化，可能改善 lidar 量化
    - **Per-channel 量化**：TRT 支持 per-channel INT8，可能改善精度
 
 5. **SwinTransformer 量化探索（不更换主干的替代方案）**  
@@ -1110,9 +1175,12 @@ NVIDIA 官方提供了 [CUDA-BEVFusion](https://github.com/NVIDIA-AI-IOT/Lidar_A
 - **Mini 数据集 vs 完整数据集**：完整验证集的结论更稳定，mini 数据集（81 帧）的 INT8 精度波动（如 SwinT NDS −0.0077）在完整数据集上收敛为更温和的 −0.0047。SwinT FP16 从 mini 集的 −0.0005 改善为完整集的 +0.0000
 - **Hybrid 架构验证成功**：TRT 引擎与 PyTorch 通过 CUDA 显存零拷贝无缝协作，支持 4 模块（SwinT）和 5 模块（ResNet-50）两种配置
 - **工程价值**：建立了完整的 PTQ → FakeQuant 评估 → ONNX 导出 → TRT 引擎构建 → Hybrid 端到端验证的工具链，支持自动检测 backbone 类型并选择对应的量化策略
+- **vtransform 是全量化的主要障碍**：全模块消融实验与 LWC/MSEObserver 实验共同揭示，8/8 全量化的精度崩溃（NDS −0.251）源于 vtransform + lidar 量化的非线性协同劣化，且在 fuser 处放大——而非单纯由稀疏卷积校准质量决定
+- **精细化校准策略的边界条件**：LWC 和 MSEObserver 对 NDS 无显著改善，说明 lidar 权重和激活本身并非关键瓶颈；精细化策略的有效性取决于目标模块是否真正存在“高影响离群点”，而非仅靠范围利用率等统计指标判断
 
 ### 12.4 待完成
 
 - 推理速度测量（端到端延迟 / FPS）
 - TransFusionHead 量化探索（最后 1/6 模块）
 - ResNet-50 更长训练以缩小与 SwinT 的 FP32 精度差距（当前 NDS 0.4989 vs 0.7069）
+- ~~LWC + MSEObserver 消融实验~~ ✅ 已完成（2026-03-09，详见 §9.8）——结论：6/8 方案已是最优选择，当前主要待办事项为上述前三项
