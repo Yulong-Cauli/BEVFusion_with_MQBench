@@ -227,5 +227,130 @@ tar xzf server_ptq_results.tar.gz
 |------|-----|------|
 | SwinT FP32 基线（6019帧） | 0.7069 | 已完成 |
 | SwinT PTQ 4/6（6019帧） | 0.7015 | 已完成 |
+| SwinT PTQ 8/8 MinMax（6019帧）| 0.5754 | 已完成 |
 | SwinT TRT FP16（6019帧） | 0.7069 | 已完成 |
 | SwinT TRT INT8（6019帧） | 0.7022 | 已完成 |
+
+---
+
+## Round 2：LWC + 激活 Observer 消融实验
+
+> **目标**：验证 LWC（权重截断）和 MSEObserver（激活校准优化）对 lidar/backbone 量化精度的改善  
+> **基线**：PTQ 8/8 MinMax only → NDS = 0.5754（最大精度瓶颈来自 lidar/backbone）  
+> **新增功能**：`--lwc`（权重截断）+ `--act-observer {mse,ema_quantile}`（激活 Observer）
+
+### Round 2 Step 0：打包上传
+
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+cd D:\Research\Replication\BEVFusion_with_MQBench
+git archive HEAD --format=tar.gz -o code_update.tar.gz -- tools/quant_ptq_minmax.py
+
+scp code_update.tar.gz yellowstone@10.129.51.101:/tmp/
+
+ssh yellowstone@10.129.51.101 `
+    "cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench && tar xzf /tmp/code_update.tar.gz && rm /tmp/code_update.tar.gz && echo 'Upload OK'"
+```
+
+### Round 2 Step 1：实验清单（4 个实验并行）
+
+| GPU# | 实验 | 命令关键参数 | 对比 |
+|------|------|-------------|------|
+| GPU#0 | LWC only | `--lwc` | 权重截断单独效果 |
+| GPU#1 | MSE observer only | `--act-observer mse` | 激活 Observer 单独效果 |
+| GPU#3 | LWC + MSE | `--lwc --act-observer mse` | 双管齐下（推荐） |
+| GPU#4 | LWC + EMA Quantile | `--lwc --act-observer ema_quantile` | 百分位截断对比 |
+
+> 基线 PTQ 8/8 MinMax（NDS=0.5754）已有，无需重测。
+
+### Round 2 Step 2：启动实验
+
+**每个 tmux 窗口先执行：**
+
+```bash
+conda activate bevfusion_mqbench
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+export LD_LIBRARY_PATH=$(python -c "import torch,os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"):$LD_LIBRARY_PATH
+```
+
+---
+
+#### GPU#0 — PTQ 8/8 + LWC only
+
+```bash
+tmux attach -t gpu0
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --run-dir runs/server_ptq_8of8_lwc \
+    --lwc \
+    --calib-batches 128 2>&1 | tee logs/results_server_ptq_8of8_lwc.log
+# Ctrl+B D 断开
+```
+
+#### GPU#1 — PTQ 8/8 + MSE observer
+
+```bash
+tmux attach -t gpu1
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --run-dir runs/server_ptq_8of8_mse \
+    --act-observer mse \
+    --calib-batches 128 2>&1 | tee logs/results_server_ptq_8of8_mse.log
+# Ctrl+B D 断开
+```
+
+#### GPU#3 — PTQ 8/8 + LWC + MSE（推荐组合）
+
+```bash
+tmux attach -t gpu3
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --run-dir runs/server_ptq_8of8_lwc_mse \
+    --lwc --act-observer mse \
+    --calib-batches 128 2>&1 | tee logs/results_server_ptq_8of8_lwc_mse.log
+# Ctrl+B D 断开
+```
+
+#### GPU#4 — PTQ 8/8 + LWC + EMA Quantile
+
+```bash
+tmux attach -t gpu4
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load_from pretrained/bevfusion-det.pth \
+    --run-dir runs/server_ptq_8of8_lwc_quantile \
+    --lwc --act-observer ema_quantile \
+    --calib-batches 128 2>&1 | tee logs/results_server_ptq_8of8_lwc_quantile.log
+# Ctrl+B D 断开
+```
+
+### Round 2 Step 3：传回结果
+
+```bash
+# 在服务器执行
+tar czf server_lwc_results.tar.gz \
+    logs/results_server_ptq_8of8_lwc*.log \
+    logs/results_server_ptq_8of8_mse.log
+ls -lh server_lwc_results.tar.gz
+```
+
+**本地拉取：**
+
+```powershell
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/server_lwc_results.tar.gz `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\
+
+cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
+tar xzf server_lwc_results.tar.gz
+```
