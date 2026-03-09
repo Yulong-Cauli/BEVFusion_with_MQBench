@@ -1121,6 +1121,10 @@ def main():
     calib_cfg.test_mode = True
     calib_dataset = build_dataset(calib_cfg)
     calib_shuffle = args.calib_shuffle
+    if calib_shuffle and not hasattr(calib_dataset, 'flag'):
+        # mmdet GroupSampler requires dataset.flag; test_mode datasets lack it.
+        # Set a dummy flag (all zeros = single group) to allow shuffle.
+        calib_dataset.flag = np.zeros(len(calib_dataset), dtype=np.uint8)
     calib_loader = build_dataloader(
         calib_dataset,
         samples_per_gpu=1,
