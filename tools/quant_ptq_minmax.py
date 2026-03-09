@@ -64,7 +64,7 @@ try:
     from mqbench.prepare_by_platform import prepare_by_platform, BackendType
     from mqbench.utils.state import enable_calibration, enable_quantization
     from mqbench.fake_quantize import LearnableFakeQuantize
-    from mqbench.observer import MinMaxObserver, EMAMinMaxObserver
+    from mqbench.observer import MinMaxObserver, EMAMinMaxObserver, MSEObserver, EMAQuantileObserver
     from mqbench.scheme import QuantizeScheme
 except ImportError:
     warnings.warn(
@@ -228,11 +228,17 @@ def manual_quantize_nontraceable(module, logger, module_name="unknown"):
 # 稀疏卷积量化：为 SparseEncoder (spconv v1.x) 提供 FakeQuant 支持
 # ============================================================================
 
-def _create_spconv_fakeq_pair():
+def _create_spconv_fakeq_pair(act_observer_cls=None):
     """创建 per-channel 量化的 FakeQuant 对，适用于稀疏卷积。
     兼容不同版本 MQBench（不依赖 symmetric_range kwarg）。
     稀疏卷积权重形状为 [K,K,K,C_in,C_out]，ch_axis=4（输出通道维度）。
+
+    Args:
+        act_observer_cls: 激活 Observer 类（默认 EMAMinMaxObserver）。
+            可选 MSEObserver / EMAQuantileObserver 以缓解离群点导致的范围浪费。
     """
+    if act_observer_cls is None:
+        act_observer_cls = EMAMinMaxObserver
     w_params = QuantizeScheme(
         symmetry=True, per_channel=True, pot_scale=False, bit=8
     ).to_observer_params()
@@ -243,7 +249,7 @@ def _create_spconv_fakeq_pair():
     ).to_observer_params()
     a_params['quant_min'] = -127
     weight_fq = LearnableFakeQuantize(observer=MinMaxObserver, **w_params)
-    act_fq = LearnableFakeQuantize(observer=EMAMinMaxObserver, **a_params)
+    act_fq = LearnableFakeQuantize(observer=act_observer_cls, **a_params)
     return weight_fq, act_fq
 
 
@@ -256,10 +262,10 @@ class _QuantizedSparseConv(SparseModule):
       - 权重量化：临时替换 weight.data 为 FakeQuant 后的版本，调用原始 forward
     """
 
-    def __init__(self, original):
+    def __init__(self, original, act_observer_cls=None):
         super().__init__()
         self.conv = original
-        self.weight_fake_quant, self.act_fake_quant = _create_spconv_fakeq_pair()
+        self.weight_fake_quant, self.act_fake_quant = _create_spconv_fakeq_pair(act_observer_cls)
 
     @property
     def weight(self):
@@ -281,7 +287,7 @@ class _QuantizedSparseConv(SparseModule):
         return output
 
 
-def manual_quantize_sparse(module, logger, module_name="unknown"):
+def manual_quantize_sparse(module, logger, module_name="unknown", act_observer_cls=None):
     """对 SparseEncoder 中的稀疏卷积层插入 FakeQuantize 节点。
 
     替换所有 SparseConvolution (SubMConv3d/SparseConv3d) 为带 FakeQuant 的包装版本。
@@ -292,7 +298,7 @@ def manual_quantize_sparse(module, logger, module_name="unknown"):
         if isinstance(child, SparseConvolution) and not isinstance(
             child, _QuantizedSparseConv
         ):
-            replacements.append((name, _QuantizedSparseConv(child)))
+            replacements.append((name, _QuantizedSparseConv(child, act_observer_cls)))
 
     for name, replacement in replacements:
         _set_nested_attr(module, name, replacement)
@@ -368,7 +374,7 @@ def _set_nested_attr(obj, key: str, value):
         setattr(obj, last, value)
 
 
-def apply_selective_ptq(model, backend_type, logger, skip_modules=None):
+def apply_selective_ptq(model, backend_type, logger, skip_modules=None, act_observer_cls=None):
     """
     对模型中全部可量化子模块插入 FakeQuantize 节点。
 
@@ -381,6 +387,7 @@ def apply_selective_ptq(model, backend_type, logger, skip_modules=None):
         model (nn.Module): 原始浮点模型
         backend_type (BackendType): 目标后端（TensorRT）
         skip_modules (list[str] | None): 要跳过的模块 display_name 列表
+        act_observer_cls: 稀疏卷积激活 Observer 类（默认 EMAMinMaxObserver）
         logger: 日志记录器
 
     Returns:
@@ -414,7 +421,7 @@ def apply_selective_ptq(model, backend_type, logger, skip_modules=None):
         # 路径 3: 稀疏卷积量化（SparseEncoder 内无 Conv2d，需专用处理）
         if _has_sparse_conv(submodule):
             try:
-                manual_quantize_sparse(submodule, logger, display_name)
+                manual_quantize_sparse(submodule, logger, display_name, act_observer_cls)
                 success.append(f"{display_name} (稀疏)")
                 return
             except Exception as e2:
@@ -692,7 +699,7 @@ def run_calibration(model, data_loader, num_batches, logger):
 # 构建模型
 # ============================================================================
 
-def build_ptq_model(cfg, logger, skip_modules=None):
+def build_ptq_model(cfg, logger, skip_modules=None, act_observer_cls=None):
     """
     构建浮点模型，加载预训练权重，再对可量化子模块进行 PTQ 准备。
 
@@ -700,6 +707,7 @@ def build_ptq_model(cfg, logger, skip_modules=None):
         cfg: mmcv Config 对象
         logger: 日志记录器
         skip_modules (list[str] | None): 要跳过的模块 display_name 列表
+        act_observer_cls: 稀疏卷积激活 Observer 类（默认 EMAMinMaxObserver）
 
     Returns:
         nn.Module: 已对可量化子模块插入 FakeQuantize 节点的模型
@@ -725,7 +733,7 @@ def build_ptq_model(cfg, logger, skip_modules=None):
     # 4. 选择性 PTQ 准备（仅对可量化子模块插入 FakeQuantize 节点）
     backend_type = BackendType.Tensorrt
     logger.info("开始对可量化子模块进行 PTQ 准备 (MinMax + TensorRT INT8) ...")
-    model, success, failed = apply_selective_ptq(model, backend_type, logger, skip_modules=skip_modules)
+    model, success, failed = apply_selective_ptq(model, backend_type, logger, skip_modules=skip_modules, act_observer_cls=act_observer_cls)
 
     return model, success, failed
 
@@ -1049,6 +1057,17 @@ def main():
         default=500,
         help="LWC optimization iterations per layer (default: 500)",
     )
+    # 稀疏卷积激活 Observer 选择
+    parser.add_argument(
+        "--act-observer",
+        type=str,
+        default="ema_minmax",
+        choices=["ema_minmax", "mse", "ema_quantile"],
+        help="activation observer for sparse conv (lidar/backbone) quantization. "
+             "ema_minmax: EMA MinMax (default, baseline); "
+             "mse: MSE-optimal range (recommended for heavy-tailed distributions); "
+             "ema_quantile: percentile-based clipping (threshold=0.99999)",
+    )
     args, opts = parser.parse_known_args()
 
     configs.load(args.config, recursive=True)
@@ -1116,8 +1135,21 @@ def main():
     # ------------------------------------------------------------------
     # Step 2: 构建 PTQ 模型
     # ------------------------------------------------------------------
-    logger.info("构建 PTQ 模型（选择性 MinMax 量化）...")
-    model, quant_success, quant_failed = build_ptq_model(cfg, logger, skip_modules=args.skip_modules)
+    ACT_OBSERVER_MAP = {
+        "ema_minmax": EMAMinMaxObserver,
+        "mse": MSEObserver,
+        "ema_quantile": EMAQuantileObserver,
+    }
+    act_obs_cls = ACT_OBSERVER_MAP[args.act_observer]
+    act_obs_name = {
+        "ema_minmax": "EMAMinMaxObserver",
+        "mse": "MSEObserver (MSE-optimal range)",
+        "ema_quantile": "EMAQuantileObserver (percentile clipping)",
+    }[args.act_observer]
+    logger.info(f"构建 PTQ 模型（选择性 MinMax 量化，稀疏卷积激活 Observer: {act_obs_name}）...")
+    model, quant_success, quant_failed = build_ptq_model(
+        cfg, logger, skip_modules=args.skip_modules, act_observer_cls=act_obs_cls
+    )
     model = MMDataParallel(model.cuda(), device_ids=[0])
     logger.info("模型已移动到 GPU（MMDataParallel）。")
 
@@ -1148,6 +1180,9 @@ def main():
     logger.info(f"║  量化失败: {len(quant_failed):>2d} 个模块  →  {', '.join(quant_failed) if quant_failed else '(无)'}")
     logger.info(f"║  主动跳过: {', '.join(args.skip_modules) if args.skip_modules else '(无)'}")
     logger.info(f"║  覆盖率  : {coverage_pct:.0f}%  ({len(quant_success)}/{total_possible} 个可量化模块)")
+    logger.info(f"║  稀疏激活: {act_obs_name}")
+    if args.lwc:
+        logger.info(f"║  LWC     : ON (lr={args.lwc_lr}, iters={args.lwc_iters})")
     if quant_failed:
         logger.warning("║")
         logger.warning("║  ⚠️  有模块量化失败！如果结果不符合预期，请 Ctrl+C 停止。")
@@ -1193,6 +1228,7 @@ def main():
     meta = {
         "ptq_method": "MinMax" + ("+LWC" if args.lwc else ""),
         "backend": "TensorRT",
+        "sparse_act_observer": args.act_observer,
         "quantized_modules": [k for k, _ in _QUANTIZABLE_SUBMODULE_KEYS]
         + ["heads/*"],
         "skipped_modules": [
