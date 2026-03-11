@@ -536,3 +536,111 @@ tar xzf server_calib512_results.tar.gz
 | 8/8 LWC+shuffle512 vs 旧 LWC (0.4545) | shuffle 对 LWC 优化目标的影响（核心） |
 | 8/8 LWC+MSE+shuffle512 vs 旧 LWC+MSE (0.4526) | 组合策略+好校准集的上限 |
 
+---
+
+## Round 4：KL 散度 Observer 实验（2026-03-11）
+
+### 背景
+
+Round 3 确认 EMAMinMaxObserver 是 8/8 精度崩溃的主因之一：vtransform downsample 层 94~97% range waste。
+实现了 `KLDivergenceObserver`（类似 TensorRT entropy calibrator），在 mini 数据集上取得显著改善：
+- 8/8 KL(both): NDS 0.4285 → 0.5085（+13.9 pts）
+
+### Step 0：上传代码到服务器
+
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+cd D:\Research\Replication\BEVFusion_with_MQBench
+
+# 打包 KL Observer 分支代码
+git archive exp/lss-kl-divergence-calibration --format=tar.gz -o code_update_kl.tar.gz `
+    tools/quant_ptq_minmax.py `
+    AGENTS.md `
+    docs/RESULTS_LOG.md `
+    docs/SERVER_DEPLOY.md
+
+# 上传到服务器
+scp code_update_kl.tar.gz yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/
+```
+
+```bash
+# ===== 在服务器执行 =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+tar xzf code_update_kl.tar.gz
+```
+
+### Step 1：运行 4 个 KL Observer 实验（4×GPU 并行）
+
+```bash
+# ===== 在服务器执行 =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+
+# GPU#0: 8/8 KL(both) — 核心实验
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 nohup python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --calib-batches 512 --calib-shuffle \
+    --vtransform-observer kl_divergence \
+    --act-observer kl_divergence \
+    > logs/results_server_ptq_8of8_kl_both.log 2>&1 &
+
+# GPU#1: 7/8 +vtransform KL — 隔离 vtransform KL 效果
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 nohup python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --skip-modules lidar/backbone \
+    --calib-batches 512 --calib-shuffle \
+    --vtransform-observer kl_divergence \
+    > logs/results_server_ptq_7of8_vt_kl.log 2>&1 &
+
+# GPU#3: 7/8 +lidar KL — 隔离 lidar KL 效果
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 nohup python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --skip-modules camera/vtransform \
+    --calib-batches 512 --calib-shuffle \
+    --act-observer kl_divergence \
+    > logs/results_server_ptq_7of8_lidar_kl.log 2>&1 &
+
+# GPU#4: 8/8 KL(vt only) — KL 仅对 vtransform，lidar 仍用 EMAMinMax
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 nohup python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --calib-batches 512 --calib-shuffle \
+    --vtransform-observer kl_divergence \
+    > logs/results_server_ptq_8of8_kl_vt.log 2>&1 &
+
+# 监控运行状态
+watch -n 30 'for f in logs/results_server_ptq_*_kl*.log; do echo "=== $f ==="; tail -3 "$f"; echo; done'
+```
+
+### Step 2：结果回收
+
+```bash
+# 服务器打包
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+tar czf server_kl_results.tar.gz \
+    logs/results_server_ptq_8of8_kl_both.log \
+    logs/results_server_ptq_7of8_vt_kl.log \
+    logs/results_server_ptq_7of8_lidar_kl.log \
+    logs/results_server_ptq_8of8_kl_vt.log
+```
+
+```powershell
+# 本地拉取
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/server_kl_results.tar.gz `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\
+cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
+tar xzf server_kl_results.tar.gz
+```
+
+### Round 4 结果解读指引
+
+| 对比 | mini 结果 | 预期全量结果 | 意义 |
+|------|-----------|-------------|------|
+| 8/8 KL(both) vs 8/8 EMA (0.4562) | 0.5085 (+13.9 pts) | 预计 +5~10 pts | KL 综合效果 |
+| 7/8+vt KL vs 7/8+vt EMA (0.6179) | 0.5720 vs 0.5474 | 预计 NDS ~0.66+ | vtransform KL 隔离效果 |
+| 7/8+lidar KL vs 7/8+lidar EMA (0.5751) | 0.5173 vs 0.4734 | 预计 NDS ~0.60+ | lidar KL 隔离效果 |
+| 8/8 KL(vt) vs 8/8 EMA (0.4562) | 0.4680 vs 0.4285 | 预计 +2~5 pts | 仅 vtransform 侧 KL 的贡献 |
+
