@@ -6,6 +6,27 @@
 
 ---
 
+## ⚠️ 服务器命令规范（必读）
+
+**永远不要用 `nohup ... &`。** 用户在 tmux 里直接运行，tmux 本身已经保证断线不丢进程。
+
+✅ **正确写法**（输出直接显示在 tmux，同时写 log 文件）：
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=X python tools/xxx.py ... 2>&1 | tee logs/xxx.log
+```
+
+✅ **不需要 log 文件时**：
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=X python tools/xxx.py ...
+```
+
+❌ **禁止写法**：
+```bash
+nohup python ... > logs/xxx.log 2>&1 &   # 输出不可见，用户无法在 tmux 里看到进度
+```
+
+---
+
 ## Step 0：打包上传（本地 PowerShell）
 
 ```powershell

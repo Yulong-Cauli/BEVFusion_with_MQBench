@@ -97,6 +97,11 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 ## 关键约束（务必遵守）
 
+### 0. 服务器命令规范
+**永远不要用 `nohup ... &`。** 用户在 tmux 里直接运行，tmux 本身保证断线不丢进程。
+- ✅ 正确：`CUDA_VISIBLE_DEVICES=X python tools/xxx.py ... 2>&1 | tee logs/xxx.log`
+- ❌ 禁止：`nohup python ... > logs/xxx.log 2>&1 &`
+
 ### 1. 不能破坏已有工作状态
 - 修改代码后必须跑 `tools/test.py` 确认 NDS 仍在 0.578 以上
 - PTQ 脚本的已有量化逻辑不能被破坏，扩大覆盖必须是向后兼容的**追加**
