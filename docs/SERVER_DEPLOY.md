@@ -571,8 +571,18 @@ tar xzf code_update_kl.tar.gz
 
 ### Step 1：运行 4 个 KL Observer 实验（4×GPU，各开一个 tmux pane）
 
-> **注意**：GPU#0 的 8/8 KL(both) 512 batch 已经在跑了。
-> 下面 GPU#1/3/4 在各自 tmux pane 里直接运行（不用 nohup &，输出直接可见）。
+```bash
+# ===== tmux pane for GPU#0: 8/8 KL(both) — 核心实验 =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --calib-batches 512 --calib-shuffle \
+    --vtransform-observer kl_divergence \
+    --act-observer kl_divergence \
+    2>&1 | tee logs/results_server_ptq_8of8_kl_both.log
+```
 
 ```bash
 # ===== tmux pane for GPU#1: 7/8 +vtransform KL =====
