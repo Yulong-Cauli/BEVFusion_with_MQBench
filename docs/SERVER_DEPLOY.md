@@ -569,70 +569,47 @@ cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
 tar xzf code_update_kl.tar.gz
 ```
 
-### Step 1：运行 4 个 KL Observer 实验（4×GPU 并行）
+### Step 1：运行 4 个 KL Observer 实验（4×GPU，各开一个 tmux pane）
+
+> **注意**：GPU#0 的 8/8 KL(both) 512 batch 已经在跑了。
+> 下面 GPU#1/3/4 在各自 tmux pane 里直接运行（不用 nohup &，输出直接可见）。
 
 ```bash
-# ===== 在服务器执行 =====
+# ===== tmux pane for GPU#1: 7/8 +vtransform KL =====
 cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
 conda activate bevfusion_mqbench
-
-# GPU#0: 8/8 KL(both) — 核心实验
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 nohup python tools/quant_ptq_minmax.py \
-    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
-    --load-from pretrained/bevfusion-det.pth \
-    --calib-batches 512 --calib-shuffle \
-    --vtransform-observer kl_divergence \
-    --act-observer kl_divergence \
-    > logs/results_server_ptq_8of8_kl_both.log 2>&1 &
-
-# GPU#1: 7/8 +vtransform KL — 隔离 vtransform KL 效果
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 nohup python tools/quant_ptq_minmax.py \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load-from pretrained/bevfusion-det.pth \
     --skip-modules lidar/backbone \
     --calib-batches 512 --calib-shuffle \
     --vtransform-observer kl_divergence \
-    > logs/results_server_ptq_7of8_vt_kl.log 2>&1 &
+    2>&1 | tee logs/results_server_ptq_7of8_vt_kl.log
+```
 
-# GPU#3: 7/8 +lidar KL — 隔离 lidar KL 效果
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 nohup python tools/quant_ptq_minmax.py \
+```bash
+# ===== tmux pane for GPU#3: 7/8 +lidar KL =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load-from pretrained/bevfusion-det.pth \
     --skip-modules camera/vtransform \
     --calib-batches 512 --calib-shuffle \
     --act-observer kl_divergence \
-    > logs/results_server_ptq_7of8_lidar_kl.log 2>&1 &
+    2>&1 | tee logs/results_server_ptq_7of8_lidar_kl.log
+```
 
-# GPU#4: 8/8 KL(vt only) — KL 仅对 vtransform，lidar 仍用 EMAMinMax
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 nohup python tools/quant_ptq_minmax.py \
+```bash
+# ===== tmux pane for GPU#4: 8/8 KL(vt only) =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load-from pretrained/bevfusion-det.pth \
     --calib-batches 512 --calib-shuffle \
     --vtransform-observer kl_divergence \
-    > logs/results_server_ptq_8of8_kl_vt.log 2>&1 &
-
-# 监控运行状态
-watch -n 30 'for f in logs/results_server_ptq_*_kl*.log; do echo "=== $f ==="; tail -3 "$f"; echo; done'
-```
-
-### Step 2：结果回收
-
-```bash
-# 服务器打包
-cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
-tar czf server_kl_results.tar.gz \
-    logs/results_server_ptq_8of8_kl_both.log \
-    logs/results_server_ptq_7of8_vt_kl.log \
-    logs/results_server_ptq_7of8_lidar_kl.log \
-    logs/results_server_ptq_8of8_kl_vt.log
-```
-
-```powershell
-# 本地拉取
-scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/server_kl_results.tar.gz `
-    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\
-cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
-tar xzf server_kl_results.tar.gz
+    2>&1 | tee logs/results_server_ptq_8of8_kl_vt.log
 ```
 
 ### Round 4 结果解读指引
@@ -643,4 +620,57 @@ tar xzf server_kl_results.tar.gz
 | 7/8+vt KL vs 7/8+vt EMA (0.6179) | 0.5720 vs 0.5474 | 预计 NDS ~0.66+ | vtransform KL 隔离效果 |
 | 7/8+lidar KL vs 7/8+lidar EMA (0.5751) | 0.5173 vs 0.4734 | 预计 NDS ~0.60+ | lidar KL 隔离效果 |
 | 8/8 KL(vt) vs 8/8 EMA (0.4562) | 0.4680 vs 0.4285 | 预计 +2~5 pts | 仅 vtransform 侧 KL 的贡献 |
+
+---
+
+## Round 5：KL Observer + 128 calib batch（2026-03-11）
+
+> **背景**：Round 3 已证明 512 batch shuffle 相比 128 batch 对 EMAMinMax 几乎无收益（8/8 仅 +2.6%）。
+> 对 KL Observer 而言，因为 KL 本身通过直方图积累多个 batch，128 batch 应已足够（服务器验证集不像 EMAMinMax 那样需要多样性）。
+> Round 5 用 128 calib batch 重跑核心实验，与 Round 4 的 512 batch 对比，验证校准量的影响。
+
+### 运行命令（Round 4 全部完成后再跑）
+
+```bash
+# ===== tmux pane for GPU#0: 8/8 KL(both) 128 batch =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --calib-batches 128 \
+    --vtransform-observer kl_divergence \
+    --act-observer kl_divergence \
+    2>&1 | tee logs/results_server_ptq_8of8_kl_both_128.log
+```
+
+```bash
+# ===== tmux pane for GPU#1: 7/8 +vtransform KL 128 batch =====
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --skip-modules lidar/backbone \
+    --calib-batches 128 \
+    --vtransform-observer kl_divergence \
+    2>&1 | tee logs/results_server_ptq_7of8_vt_kl_128.log
+```
+
+```bash
+# ===== tmux pane for GPU#3: 7/8 +lidar KL 128 batch =====
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --skip-modules camera/vtransform \
+    --calib-batches 128 \
+    --act-observer kl_divergence \
+    2>&1 | tee logs/results_server_ptq_7of8_lidar_kl_128.log
+```
+
+### Round 5 结果解读指引
+
+| 对比 | 意义 |
+|------|------|
+| 8/8 KL 128 vs 8/8 KL 512 | KL 对校准量是否敏感（预期 ±0.005 以内） |
+| 7/8+vt KL 128 vs 7/8+vt KL 512 | vtransform KL 的校准量敏感性 |
+| 7/8+lidar KL 128 vs 7/8+lidar KL 512 | lidar KL 的校准量敏感性 |
 
