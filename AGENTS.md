@@ -33,49 +33,42 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 **只做量化，不改模型架构**。ResNet-50/ConvNeXt 替换方案已降为辅助验证，不是主线。
 主线是：在原始 SwinT BEVFusion 上，做尽可能完整和精细的 PTQ INT8 量化研究。
 
-## 当前实验状态（03-11）
+## 当前实验状态（03-12）
 
 ### 已完成的核心实验（全部 6019 帧完整验证集）
 
 | 实验 | 量化模块 | NDS | mAP | 说明 |
 |------|---------|-----|-----|------|
 | FP32 基线 | 0/8 | 0.7069 | 0.6728 | 基准 |
-| PTQ 6/8（推荐配置） | 6/8 | 0.7010 | 0.6614 | skip vtransform+lidar，**−0.83%** |
-| PTQ 7/8 +vtransform | 7/8 | 0.6179 | 0.5194 | **−12.6%**，bev_pool 激活量化 |
-| PTQ 7/8 +lidar | 7/8 | 0.5751 | 0.5394 | **−18.6%**，稀疏激活量化 |
-| PTQ 8/8 MinMax 基线 | 8/8 | 0.4562 | 0.3536 | **−35.5%**，vtransform+lidar 协同劣化 |
-| PTQ 8/8 + LWC | 8/8 | 0.4545 | 0.3540 | LWC 无效（0.11% 截断率，MSE 1e-5） |
-| PTQ 8/8 + MSEObserver | 8/8 | 0.4560 | 0.3522 | MSEObserver 无效 |
-| PTQ 8/8 + LWC+MSE | 8/8 | 0.4526 | 0.3519 | 组合反而略差 |
-| PTQ 8/8 + 512+shuffle | 8/8 | 0.4680 | 0.3598 | 校准多样性有帮助（+2.6%） |
+| **7/8 +vt KL（新最优）** | 7/8 | **0.7033** | **0.6657** | **−0.5%**，KL Observer 128batch |
+| PTQ 6/8（旧最优） | 6/8 | 0.7010 | 0.6614 | −0.83%，skip vtransform+lidar |
+| PTQ 7/8 +vtransform EMA | 7/8 | 0.6179 | 0.5194 | −12.6%，bev_pool 激活量化 |
+| 7/8 +lidar KL | 7/8 | 0.5758 | 0.5452 | −18.5%，KL 对 lidar 几乎无效 |
+| PTQ 7/8 +lidar EMA | 7/8 | 0.5751 | 0.5394 | −18.6%，稀疏激活量化 |
+| **8/8 KL(both) 128** | 8/8 | **0.5750** | **0.5444** | **−18.7%**，比 EMA 提升 11.9 pts |
+| 8/8 KL(vt) 128 | 8/8 | 0.5706 | 0.5221 | −19.3% |
+| PTQ 8/8 + 512+shuffle | 8/8 | 0.4680 | 0.3598 | EMA 基线 +shuffle |
+| PTQ 8/8 MinMax 基线 | 8/8 | 0.4562 | 0.3536 | −35.5%，vtransform+lidar 协同劣化 |
 
-### Round 4：KL 散度 Observer（本地 mini 验证集初步结果）
+### Round 4+5：KL Observer 全量验证（2026-03-12，已完成）
 
 **分支**：`exp/lss-kl-divergence-calibration`
 
-| 配置 | NDS | mAP | Δ NDS | vt observer | lidar observer |
-|------|-----|-----|-------|-------------|----------------|
-| 0/8 FP32 | 0.5788 | 0.5732 | 0% | — | — |
-| 6/8（skip vt+lidar） | 0.5779 | 0.5709 | −0.2% | skip | skip |
-| 7/8 +vt EMAMinMax | 0.5474 | 0.5060 | −5.4% | EMA | skip |
-| 7/8 +vt **KL** | **0.5720** | **0.5642** | **−1.2%** | KL | skip |
-| 7/8 +lidar EMAMinMax | 0.4734 | 0.4639 | −18.2% | skip | EMA |
-| 7/8 +lidar **KL** | **0.5173** | **0.4961** | **−10.6%** | skip | KL |
-| 8/8 EMAMinMax | 0.4285 | 0.3626 | −26.0% | EMA | EMA |
-| 8/8 KL(vt) | 0.4680 | 0.4553 | −19.1% | KL | EMA |
-| **8/8 KL(both)** | **0.5085** | **0.4817** | **−12.1%** | KL | KL |
+#### 128 vs 512 校准量对比（128 全面优于 512）
 
-**KL Observer 总结**：
-- vtransform: −5.4% → −1.2%（拯救 4.2 NDS 点）
-- lidar: −18.2% → −10.6%（拯救 7.6 NDS 点）
-- 8/8 综合: −26.0% → −12.1%（拯救 13.9 NDS 点）
-- **待服务器全量验证**
+| 配置 | NDS (128) | NDS (512) | Δ | mAP (128) | mAP (512) |
+|------|-----------|-----------|---|-----------|-----------|
+| 7/8 +vt KL | **0.7033** | 0.6874 | +0.016 | **0.6657** | 0.6427 |
+| 7/8 +lidar KL | 0.5758 | 0.5745 | +0.001 | 0.5452 | 0.5414 |
+| 8/8 KL(both) | **0.5750** | 0.5628 | +0.012 | **0.5444** | 0.5123 |
+| 8/8 KL(vt) | 0.5706 | 0.5656 | +0.005 | 0.5221 | 0.5137 |
 
 **已确认结论**：
-1. **6/8 是当前最优实用配置**（NDS −0.83%，理论 INT8 体积 −65%）
-2. **KL Observer 大幅改善 8/8 精度**（mini 数据集 +13.9 NDS 点），待服务器确认
-3. vtransform 量化瓶颈本质是 EMAMinMax 的 range waste，KL 截断几乎消除（−1.2% vs −5.4%）
-4. lidar 量化瓶颈更深层（稀疏激活 per-tensor 量化固有困难），KL 有效但残留 −10.6%
+1. **新最优实用配置：7/8 +vt KL**（NDS 0.7033，−0.5%），超越旧 6/8（0.7010，−0.8%），多量化 1 个模块
+2. **KL Observer 完全解决 vtransform 量化瓶颈**：−12.6% → −0.5%，拯救 8.5 个 NDS 点
+3. **KL Observer 对 lidar 几乎无效**（全量数据集仅 +0.07 pts），mini 数据集严重高估了效果
+4. **128 batch > 512 batch**：KL 直方图不需要场景多样性，过多校准数据反而稀释分布特征
+5. **8/8 残余瓶颈完全在 lidar**：vtransform KL 已近乎无损，8/8 的 −18.7% 损失约 −18% 来自 lidar per-tensor
 
 ### Round 3 结果（已完成，2026-03-10）
 
@@ -125,9 +118,15 @@ mmdet `build_dataloader(shuffle=True)` 需要 `dataset.flag`，但 `test_mode=Tr
 
 ## 下一步待做任务（按优先级）
 
-### 【高优先级】服务器全量验证 KL Observer（Round 4）
-在 6019 帧完整验证集上确认 mini 数据集的 KL Observer 结果。
-需要先将分支推送到服务器，然后运行 4 个实验。
+### 【已完成 ✅】KL Observer 全量验证（Round 4+5）
+**结论**：KL 完全解决 vtransform（−12.6% → −0.5%），对 lidar 无效（−18.6% → −18.5%）。
+新最优配置：7/8 +vt KL（NDS 0.7033，−0.5%），128 batch > 512 batch。
+
+### 【高优先级】攻克 lidar 量化瓶颈
+lidar per-tensor INT8 量化仍损失 −18.5%。KL Observer 无效，需要根本性方案：
+- **Per-channel 量化**：稀疏激活的 per-tensor 粒度太粗，per-channel 可能有效
+- **Mixed precision**：lidar 保持 FP16/INT16，其他 INT8
+- **AdaRound/BRECQ**：学习型权重量化方法，可能解决权重-激活联合优化问题
 
 ### 【中优先级】KL + 其他优化组合
 - KL + LWC：KL 解决激活瓶颈后，LWC 的权重优化可能有更大发挥空间
@@ -147,15 +146,15 @@ mmdet `build_dataloader(shuffle=True)` 需要 `dataset.flag`，但 `test_mode=Tr
 |------|------|--------|------|
 | camera/backbone (SwinT) | ✅ 手动路径 | ~27.5M (67.5%) | window attention 动态控制流，手动遍历 Conv2d/Linear |
 | camera/neck | ✅ fx 路径 | ~2.1M (5.2%) | 无问题 |
-| camera/vtransform | ✅ 手动路径 | ~1.0M (2.5%) | EMA: −12.6%, **KL: −1.2%**（mini） |
-| lidar/backbone | ✅ 稀疏卷积路径 | ~5.0M (12.3%) | EMA: −18.6%, **KL: −10.6%**（mini） |
+| camera/vtransform | ✅ 手动路径 | ~1.0M (2.5%) | EMA: −12.6%, **KL: −0.5%** ✨ |
+| lidar/backbone | ✅ 稀疏卷积路径 | ~5.0M (12.3%) | EMA: −18.6%, KL: −18.5%（KL 无效） |
 | fuser | ✅ fx 路径 | ~1.4M (3.4%) | 无问题 |
 | decoder/backbone | ✅ fx 路径 | ~7.4M (18.2%) | 无问题 |
 | decoder/neck | ✅ fx 路径 | ~0.3M (0.7%) | 无问题 |
 | heads/object | ✅ 手动路径 | ~1.0M (2.6%) | TransFusionHead，精度几乎无影响 |
-| **最优实用配置（6/8）** | skip vtransform+lidar | ~11.5M (28%) | **NDS 0.7010，−0.83%** |
+| **最优实用配置（7/8 +vt KL）** | skip lidar | ~35.7M (88%) | **NDS 0.7033，−0.5%** ✨ |
 | **全量化（8/8）EMA** | 全部 8 模块 | ~40.7M (100%) | **NDS 0.4562，−35.5%** |
-| **全量化（8/8）KL** | 全部 8 模块 | ~40.7M (100%) | **NDS 0.5085，−12.1%**（mini，待全量验证） |
+| **全量化（8/8）KL** | 全部 8 模块 | ~40.7M (100%) | **NDS 0.5750，−18.7%** |
 
 ## 重要技术备忘
 

@@ -697,6 +697,19 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 python tools/quant_ptq_minma
     2>&1 | tee logs/results_server_ptq_7of8_lidar_kl_128.log
 ```
 
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 python tools/quant_ptq_minmax.py \
+>     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+>     --load-from pretrained/bevfusion-det.pth \
+>     --calib-batches 128 --calib-shuffle \
+>     --vtransform-observer kl_divergence \
+>     2>&1 | tee logs/results_server_ptq_8of8_kl_vt_128.log
+```
+
+
+
+
+
 ### Round 5 结果解读指引
 
 | 对比 | 意义 |
