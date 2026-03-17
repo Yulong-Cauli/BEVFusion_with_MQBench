@@ -38,6 +38,7 @@ BEVFusion PTQ (Post-Training Quantization) with MQBench — MinMax Calibration
 import argparse
 import os
 import sys
+
 sys.path.append(os.getcwd())
 import random
 import time
@@ -92,7 +93,7 @@ class KLDivergenceObserver(ObserverBase):
     而是在校准完成后通过 KL 散度搜索最优截断阈值 T_opt，丢弃导致 INT8 范围浪费的离群值。
 
     算法：
-    1. 校准阶段：累积所有校准 batch 的激活值直方图（高分辨率，默认 8192 bins）
+    1. 校准阶段：累积所有校准 batch 的激活值直方图（高分辨率，默认 2048 bins）
     2. 校准结束后（calculate_qparams 被调用时）：
        - 遍历候选截断点 T（从 128 bins 到 num_bins）
        - 对截断后的分布 P 量化为 num_quantized_bins 个 bin，得到 Q
@@ -100,87 +101,151 @@ class KLDivergenceObserver(ObserverBase):
     3. 用 T_opt 设置 min_val/max_val（对称：[-T_opt, T_opt]）
 
     参数：
-        num_bins: 直方图分辨率（默认 8192，越高越精确但越慢）
+        num_bins: 直方图分辨率（默认 2048，越高越精确但越慢）
         num_quantized_bins: INT8 量化 bin 数（默认 255，对应 quant_min~quant_max）
         ema_ratio: EMA 平滑系数（0 = 不平滑，纯累积直方图）
+        sparse_mode: 稀疏感知模式（Round 8 新增，默认 False）。
+            True 时构建直方图只统计 |x| > 1e-6 的非零元素，消除 ReLU 零值在
+            bin[0] 产生的巨大尖峰对 KL 搜索的偏差。用于稀疏卷积激活量化。
     """
 
     def __init__(self, dtype=torch.quint8, qscheme=torch.per_tensor_affine,
                  reduce_range=False, quant_min=None, quant_max=None,
                  ch_axis=-1, pot_scale=False,
                  num_bins=2048, ema_ratio=0.0, min_percentile=0.9999,
+                 sparse_mode=False,
                  factory_kwargs=None):
         super().__init__(dtype, qscheme, reduce_range, quant_min, quant_max,
                          ch_axis, pot_scale, factory_kwargs)
-        assert self.ch_axis == -1, "KLDivergenceObserver 仅支持 per-tensor 模式"
         self.num_bins = num_bins
         self.ema_ratio = ema_ratio
         self.min_percentile = min_percentile
+        self.sparse_mode = sparse_mode  # ★ Round 8: Sparse-Aware Calibration 开关
         # 对称量化时，|x| 的量化级数 = quant_max + 1（例如 [-127,127] → 128 个正级）
         # 这是 KL 搜索时的 "目标 bin 数"
         if self.quant_min < 0:
             self.num_quantized_bins = self.quant_max + 1  # 128 for [-127, 127]
         else:
             self.num_quantized_bins = self.quant_max - self.quant_min + 1
+        # per-tensor: [num_bins]
+        # per-channel: [C, num_bins]（C 在第一次 forward 动态确定）
         self.register_buffer("histogram", torch.zeros(num_bins))
+        # per-tensor: scalar
+        # per-channel: [C]
         self.register_buffer("hist_max", torch.tensor(float(0)))
         self.register_buffer("_calibrated", torch.tensor(0, dtype=torch.long))
 
+    def _ensure_per_channel_buffers(self, num_channels: int, device, dtype):
+        """按通道模式初始化/对齐 histogram 与 hist_max。"""
+        if self.histogram.ndim != 2 or self.histogram.size(0) != num_channels:
+            self.histogram = torch.zeros(
+                (num_channels, self.num_bins), device=device, dtype=dtype
+            )
+            self.hist_max = torch.zeros(num_channels, device=device, dtype=dtype)
+
+    def _update_histogram_1d(self, abs_x: torch.Tensor, old_hist: torch.Tensor,
+                             old_max: torch.Tensor, cur_max: torch.Tensor):
+        """更新单通道（或 per-tensor）直方图。"""
+        eps = 1e-8
+        cur_max_val = max(float(cur_max.item()), eps)
+        old_max_val = float(old_max.item())
+
+        if old_max_val <= 0:
+            new_hist = torch.histc(abs_x, bins=self.num_bins, min=0, max=cur_max_val)
+            return new_hist, abs_x.new_tensor(cur_max_val)
+
+        # 需要扩展直方图范围：先将旧直方图重映射到新范围，再与新 batch 合并
+        if cur_max_val > old_max_val:
+            new_hist = torch.histc(abs_x, bins=self.num_bins, min=0, max=cur_max_val)
+            ratio = old_max_val / cur_max_val
+            rescaled = torch.zeros_like(old_hist)
+            if ratio > 0:
+                for i in range(self.num_bins):
+                    target_bin = int(i * ratio)
+                    if target_bin < self.num_bins:
+                        rescaled[target_bin] += old_hist[i]
+            if self.ema_ratio > 0:
+                merged = rescaled * self.ema_ratio + new_hist * (1.0 - self.ema_ratio)
+            else:
+                merged = rescaled + new_hist
+            return merged, abs_x.new_tensor(cur_max_val)
+
+        # 范围不变，直接累加
+        new_hist = torch.histc(abs_x, bins=self.num_bins, min=0, max=old_max_val)
+        if self.ema_ratio > 0:
+            merged = old_hist * self.ema_ratio + new_hist * (1.0 - self.ema_ratio)
+        else:
+            merged = old_hist + new_hist
+        return merged, old_max
+
     def forward(self, x_orig):
-        """累积激活值的绝对值直方图。"""
+        """累积激活值 |x| 直方图。支持 per-tensor / per-channel。
+
+        ★ Round 8 Sparse-Aware Calibration：当 sparse_mode=True 时，
+          只统计 |x| > 1e-6 的非零元素，消除 ReLU 零值在 bin[0] 的巨大尖峰。
+          对称量化下零值始终被精确映射到 INT8 的 0，不需要占用动态范围。
+        """
         if x_orig.numel() == 0:
             return x_orig
         x = x_orig.detach().to(self.min_val.dtype)
 
-        # 当前 batch 的 |x| 范围
-        cur_max = x.abs().max()
-
-        if self.hist_max == 0:
-            # 第一个 batch：初始化直方图范围
-            self.hist_max.fill_(cur_max.item())
-            self.histogram = torch.histc(
-                x.abs(), bins=self.num_bins, min=0, max=self.hist_max.item()
-            )
-        else:
-            # 后续 batch：可能需要扩展直方图范围
-            if cur_max > self.hist_max:
-                # 扩展范围：重新映射已有直方图到新范围
-                new_max = cur_max.item()
-                new_hist = torch.histc(
-                    x.abs(), bins=self.num_bins, min=0, max=new_max
-                )
-                # 将旧直方图重新分配到新范围
-                old_hist = self.histogram
-                old_max = self.hist_max.item()
-                ratio = old_max / new_max
-                old_nbins_in_new = int(round(ratio * self.num_bins))
-                if old_nbins_in_new > 0:
-                    # 将旧直方图 bin 重新分配到新直方图的前 old_nbins_in_new 个 bin
-                    rescaled = torch.zeros(self.num_bins, device=old_hist.device)
-                    for i in range(self.num_bins):
-                        target_bin = int(i * ratio)
-                        if target_bin < self.num_bins:
-                            rescaled[target_bin] += old_hist[i]
-                    if self.ema_ratio > 0:
-                        self.histogram = rescaled * self.ema_ratio + new_hist * (1.0 - self.ema_ratio)
+        if self.ch_axis == -1:
+            # ★ Sparse-Aware: 非零值专用直方图
+            if self.sparse_mode:
+                nz_mask = x.abs() > 1e-6
+                x_nz = x[nz_mask]
+                if x_nz.numel() < 10:
+                    # 非零值太少（极端稀疏帧），跳过本 batch 直方图更新
+                    min_val_cur, max_val_cur = torch._aminmax(x)
+                    if self.max_val.numel() <= 1 and self.max_val.isinf():
+                        self.min_val = min_val_cur
+                        self.max_val = max_val_cur
                     else:
-                        self.histogram = rescaled + new_hist
-                else:
-                    self.histogram = new_hist
-                self.hist_max.fill_(new_max)
+                        self.min_val = torch.min(self.min_val, min_val_cur)
+                        self.max_val = torch.max(self.max_val, max_val_cur)
+                    return x_orig
+                x_for_hist = x_nz
             else:
-                # 范围不变，直接累加
-                new_hist = torch.histc(
-                    x.abs(), bins=self.num_bins, min=0, max=self.hist_max.item()
-                )
-                if self.ema_ratio > 0:
-                    self.histogram = self.histogram * self.ema_ratio + new_hist * (1.0 - self.ema_ratio)
+                x_for_hist = x
+
+            cur_max = x_for_hist.abs().max()
+            old_hist = self.histogram if self.histogram.ndim == 1 else self.histogram.reshape(-1)
+            old_max = self.hist_max if self.hist_max.ndim == 0 else self.hist_max.reshape(-1)[0]
+            self.histogram, self.hist_max = self._update_histogram_1d(
+                x_for_hist.abs(), old_hist, old_max, cur_max
+            )
+            min_val_cur, max_val_cur = torch._aminmax(x)  # min/max 始终基于全量 x
+        else:
+            x_dim = x.size()
+            new_axis_list = [i for i in range(len(x_dim))]
+            new_axis_list[self.ch_axis] = 0
+            new_axis_list[0] = self.ch_axis
+            y = x.permute(new_axis_list)
+            y = torch.flatten(y, start_dim=1)  # [C, N]
+            num_channels = y.size(0)
+            self._ensure_per_channel_buffers(
+                num_channels, device=y.device, dtype=self.min_val.dtype
+            )
+
+            abs_y = y.abs()
+            for c in range(num_channels):
+                if self.sparse_mode:
+                    # ★ Sparse-Aware per-channel：逐通道只统计非零值
+                    nz_mask_c = abs_y[c] > 1e-6
+                    vals_c = abs_y[c][nz_mask_c]
+                    if vals_c.numel() < 10:
+                        continue
+                    cur_max_c = vals_c.max()
                 else:
-                    self.histogram = self.histogram + new_hist
+                    vals_c = abs_y[c]
+                    cur_max_c = abs_y[c].max()
+                self.histogram[c], self.hist_max[c] = self._update_histogram_1d(
+                    vals_c, self.histogram[c], self.hist_max[c], cur_max_c
+                )
+            min_val_cur, max_val_cur = torch._aminmax(y, 1)
 
         # 同时记录 min/max（供 fallback 使用）
-        min_val_cur, max_val_cur = torch._aminmax(x)
-        if self.max_val.isinf():
+        if self.max_val.numel() <= 1 and self.max_val.isinf():
             self.min_val = min_val_cur
             self.max_val = max_val_cur
         else:
@@ -189,39 +254,14 @@ class KLDivergenceObserver(ObserverBase):
 
         return x_orig
 
-    def _compute_kl_divergence(self, p, q):
-        """计算 KL(P || Q)，跳过零概率 bin。"""
-        # 避免 log(0)
-        mask = (p > 0) & (q > 0)
-        if mask.sum() == 0:
-            return float('inf')
-        p_safe = p[mask]
-        q_safe = q[mask]
-        return (p_safe * torch.log(p_safe / q_safe)).sum().item()
-
-    def _find_optimal_threshold(self):
-        """遍历截断阈值，找到 KL 散度最小的最优截断点。
-
-        修正版 TensorRT entropy calibration 算法：
-        使用完整分布 P 作为参考，正确建模 clipping 效果。
-
-        对于每个候选阈值 T（对应直方图的前 i 个 bin）：
-        1. 将完整分布中每个 bin 映射到 num_q 个量化 level
-        2. 超出阈值的 bin 被 clip 到最后一个量化 level（模拟 INT8 饱和）
-        3. 构建量化后的近似分布 Q（同一 level 内非零 bin 均分概率质量）
-        4. 计算 KL(P || Q)，选择 KL 最小的阈值
-
-        增加 min_percentile 约束：搜索范围的下界由百分位数决定，
-        确保阈值至少覆盖 min_percentile 比例的样本质量。
-        避免对重尾分布过度截断（尾部值对检测任务非常重要）。
-        """
-        hist = self.histogram.float().cpu().numpy().astype(np.float64)
+    def _find_optimal_threshold_single(self, hist: np.ndarray, hist_max_val: float):
+        """单通道 KL 最优阈值搜索。"""
+        hist = np.asarray(hist, dtype=np.float64)
         num_bins = len(hist)
         num_q = self.num_quantized_bins  # 128 for symmetric INT8
-
         total = hist.sum()
-        if total == 0:
-            return self.hist_max.item(), 0.0
+        if total <= 0 or hist_max_val <= 0:
+            return 0.0, 0.0
 
         p = hist / total  # 完整参考分布
         hist_nonzero = (hist > 0).astype(np.float64)
@@ -270,19 +310,249 @@ class KLDivergenceObserver(ObserverBase):
                 best_kl = kl
                 best_threshold_bin = i
 
-        threshold = (best_threshold_bin / num_bins) * self.hist_max.item()
-        return threshold, best_kl
+        threshold = (best_threshold_bin / num_bins) * hist_max_val
+        return float(threshold), float(best_kl)
+
+    def _find_optimal_threshold(self):
+        """KL 最优阈值搜索（per-tensor / per-channel）。"""
+        if self.ch_axis == -1:
+            hist = self.histogram.float().cpu().numpy().astype(np.float64)
+            hist_max_val = float(self.hist_max.item()) if self.hist_max.numel() == 1 else float(
+                self.hist_max.max().item())
+            return self._find_optimal_threshold_single(hist, hist_max_val)
+
+        hists = self.histogram.float().cpu().numpy().astype(np.float64)
+        hist_max = self.hist_max.float().cpu().numpy().astype(np.float64)
+        num_channels = hists.shape[0]
+        thresholds = np.zeros(num_channels, dtype=np.float64)
+        kls = np.zeros(num_channels, dtype=np.float64)
+        for c in range(num_channels):
+            thresholds[c], kls[c] = self._find_optimal_threshold_single(hists[c], hist_max[c])
+        return thresholds, kls
 
     def calculate_qparams(self):
         """在校准完成后计算量化参数。使用 KL 散度找到最优截断阈值。"""
         if self.histogram.sum() > 0:
-            threshold, kl = self._find_optimal_threshold()
+            threshold, _ = self._find_optimal_threshold()
+            if self.ch_axis == -1:
+                t = torch.tensor(float(threshold), device=self.min_val.device, dtype=self.min_val.dtype)
+            else:
+                t = torch.as_tensor(threshold, device=self.min_val.device, dtype=self.min_val.dtype)
             # 对称量化：[-threshold, threshold]
-            self.min_val = torch.tensor(-threshold, device=self.min_val.device)
-            self.max_val = torch.tensor(threshold, device=self.max_val.device)
+            self.min_val = -t
+            self.max_val = t
             self._calibrated.fill_(1)
 
         return super().calculate_qparams()
+
+
+# ============================================================================
+# Round 9：SparseLog2FakeQuantize — 对数域量化，针对稀疏卷积激活
+# ============================================================================
+#
+# 动机（基于 Round 8 W8A16 控制实验的结论）：
+#   - lidar 精度损失 95.5% 来自激活量化，权重量化代价仅 0.0001 NDS
+#   - INT8 均匀量化假设值域内均匀分布，步长固定 ≈ 0.076（T=9.7 时）
+#   - 稀疏激活（BN+ReLU 后）呈截断对数正态分布：大量有效信号集中在 (0, 0.5] 的
+#     密集区，均匀量化在此区域仅有 ~13 个格点，相对误差高达 100-200%
+#   - Log2 量化：相邻格点比例恒为 2，在 x < 1 密集区提供 ~60 个格点，
+#     对任意量级信号保持恒定相对误差（≈ 41%）
+#   - 零值仍被精确表示（稀疏卷积核心优势不变）
+
+class SparseLog2FakeQuantize(nn.Module):
+    """对数域激活量化，适用于 BN+ReLU 后的稀疏卷积特征。
+
+    可表示的非零正值集合：{2^(log2_base + k) : k ∈ [qmin, qmax]}
+    其中 log2_base 通过校准数据非零激活分布的低百分位自动估计。
+    零值始终精确还原。
+
+    与 INT8 均匀量化的关键区别：
+      - 均匀：绝对误差恒定，小幅值信号相对误差 >> 100%
+      - Log2：相对误差恒定 ≈ 41%，对对数正态稀疏分布最优
+
+    与 MQBench enable_calibration / enable_quantization 完全兼容：
+      - enable_calibration:  observer ON,  fake_quant OFF → 更新 log2_base
+      - enable_quantization: observer OFF, fake_quant ON  → 按 log2 量化
+
+    Args:
+        n_bits:        量化位宽（默认 8，正侧 127 个格点）
+        per_channel:   是否逐通道估计 base（features 形状 [N,C]，按 C 维）
+        ch_axis:       通道维度（默认 1，对应 [N,C] 的 C 维）
+        ema_ratio:     log2_base EMA 更新系数（默认 0.9）
+        percentile:    估计 base 用的分位数（默认 0.05 = 第 5 百分位）
+        eps:           零值判断阈值（默认 1e-6）
+    """
+
+    def __init__(self, n_bits=8, per_channel=False, ch_axis=1,
+                 ema_ratio=0.9, percentile=0.05, eps=1e-6):
+        super().__init__()
+        self.n_bits = n_bits
+        self.per_channel = per_channel
+        self.ch_axis = ch_axis
+        self.ema_ratio = ema_ratio
+        self.percentile = percentile
+        self.eps = eps
+        # 对称 INT8：[-127, 127]，正侧 127 个格点
+        self.qmin = -(2 ** (n_bits - 1) - 1)
+        self.qmax = (2 ** (n_bits - 1) - 1)
+
+        # log2(base)：非零激活最小幅值的对数估计
+        #   per-tensor: scalar；per-channel: [C]（第一次 forward 动态初始化）
+        self.register_buffer('log2_base', torch.tensor(-8.0))
+        # MQBench 兼容：enable_calibration / enable_quantization 查询这些标志
+        self.register_buffer('_observer_enabled', torch.tensor(1, dtype=torch.uint8))
+        self.register_buffer('_fake_quant_enabled', torch.tensor(1, dtype=torch.uint8))
+        self.register_buffer('fake_quant_enabled', torch.tensor(1, dtype=torch.uint8))
+        self.register_buffer('_initialized', torch.tensor(0, dtype=torch.uint8))
+
+    # ── MQBench 兼容接口 ──────────────────────────────────────────────────
+    def enable_observer(self, enabled=True):
+        self._observer_enabled.fill_(1 if enabled else 0)
+
+    def disable_observer(self):
+        self._observer_enabled.fill_(0)
+
+    def enable_fake_quant(self, enabled=True):
+        self._fake_quant_enabled.fill_(1 if enabled else 0)
+        self.fake_quant_enabled.fill_(1 if enabled else 0)
+
+    def disable_fake_quant(self):
+        self._fake_quant_enabled.fill_(0)
+        self.fake_quant_enabled.fill_(0)
+
+    def calculate_qparams(self):
+        """log2_base 在 forward 中 EMA 更新，此处无需额外计算。"""
+        pass
+
+    @property
+    def scale(self):
+        """等效线性 scale = 2^log2_base（供诊断 / 日志使用）。"""
+        return torch.pow(2.0, self.log2_base.float())
+
+    @property
+    def zero_point(self):
+        return torch.zeros(1, device=self.log2_base.device, dtype=torch.long)
+
+    # ── 校准：估计 log2_base ─────────────────────────────────────────────
+    def _update_base_per_tensor(self, x_nz_abs: torch.Tensor):
+        """用非零绝对值的第 p 百分位更新 log2_base（EMA）。"""
+        log2_vals = torch.log2(x_nz_abs.clamp(min=1e-30))
+        k = max(1, int(self.percentile * x_nz_abs.numel()))
+        # sort().values[k]：第 k 小的 log2 值 = 第 p 百分位
+        new_log2_base = log2_vals.sort().values[k].clamp(-20.0, 2.0)
+        if not self._initialized.item():
+            self.log2_base.fill_(new_log2_base.item())
+            self._initialized.fill_(1)
+        else:
+            self.log2_base.mul_(self.ema_ratio).add_(
+                new_log2_base * (1.0 - self.ema_ratio)
+            )
+
+    def _update_base_per_channel(self, x: torch.Tensor):
+        """逐通道更新 log2_base（EMA）。x 形状 [N, C]。"""
+        C = x.shape[1]
+        if self.log2_base.shape != torch.Size([C]):
+            # 第一次前向：动态初始化 per-channel buffer
+            self.log2_base = torch.full(
+                (C,), -8.0, device=x.device, dtype=torch.float32
+            )
+            self._initialized.fill_(0)
+
+        for c in range(C):
+            x_c = x[:, c].detach().abs()
+            nz_c = x_c[x_c > self.eps]
+            if nz_c.numel() < 5:
+                continue
+            log2_c = torch.log2(nz_c)
+            k = max(1, int(self.percentile * nz_c.numel()))
+            new_base_c = log2_c.sort().values[k].clamp(-20.0, 2.0)
+            if not self._initialized.item():
+                self.log2_base[c] = new_base_c.item()
+            else:
+                self.log2_base[c] = (
+                        self.ema_ratio * self.log2_base[c]
+                        + (1.0 - self.ema_ratio) * new_base_c.item()
+                )
+        self._initialized.fill_(1)
+
+    # ── 核心前向 ─────────────────────────────────────────────────────────
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ── 校准阶段：更新 log2_base ──────────────────────────────────────
+        if self._observer_enabled.item():
+            with torch.no_grad():
+                nz_mask = x.abs() > self.eps
+                x_nz = x[nz_mask]
+                if x_nz.numel() >= 10:
+                    if not self.per_channel:
+                        self._update_base_per_tensor(x_nz.abs().float())  # ★ .float()
+                    else:
+                        if x.ndim == 2:
+                            self._update_base_per_channel(x.detach().float())  # ★ .float()
+                        else:
+                            self._update_base_per_tensor(x_nz.abs().float())
+
+        # ── 量化推理阶段 ─────────────────────────────────────────────────
+        if not self._fake_quant_enabled.item():
+            return x
+
+        orig_dtype = x.dtype  # ★ 保存原始 dtype（可能是 float16）
+        x_f = x.float()  # ★ 提升到 float32 做对数运算
+
+        zero_mask = x_f.abs() < self.eps
+        sign = x_f.sign()
+
+        if self.per_channel and self.log2_base.ndim == 1:
+            base = self.log2_base.to(x_f.device).unsqueeze(0)
+        else:
+            base = self.log2_base.to(x_f.device)
+
+        log2_x = torch.log2(x_f.abs().clamp(min=1e-30)) - base
+        q_int = torch.round(log2_x).clamp(self.qmin, self.qmax)
+        x_dq = sign * torch.pow(2.0, q_int + base)
+        x_dq = torch.where(zero_mask, torch.zeros_like(x_f), x_dq)
+
+        # STE：梯度直通，前向使用量化值
+        out = x_f + (x_dq - x_f).detach()
+        return out.to(orig_dtype)  # ★ cast 回原始 dtype
+
+    def extra_repr(self) -> str:
+        if self.log2_base.numel() > 1:
+            base_str = (f"log2_base=[{self.log2_base.min().item():.2f}, "
+                        f"{self.log2_base.max().item():.2f}]")
+        else:
+            base_str = f"log2_base={self.log2_base.item():.2f}"
+        return (f"n_bits={self.n_bits}, per_channel={self.per_channel}, "
+                f"qmin={self.qmin}, qmax={self.qmax}, {base_str}, "
+                f"percentile={self.percentile}")
+
+
+def _report_log2_quantizer_results(model, logger):
+    """报告所有 SparseLog2FakeQuantize 节点的校准结果。"""
+    count = 0
+    inner = model.module if hasattr(model, 'module') else model
+    for name, module in inner.named_modules():
+        if isinstance(module, SparseLog2FakeQuantize):
+            b = module.log2_base
+            if module._initialized.item():
+                count += 1
+                if b.numel() == 1:
+                    logger.info(
+                        f"  Log2 [{name.split('.')[-2]}]: "
+                        f"log2_base={b.item():.3f}  "
+                        f"base={2 ** b.item():.4f}  "
+                        f"range=[{2 ** (b.item() + module.qmin):.4e}, "
+                        f"{2 ** (b.item() + module.qmax):.4f}]"
+                    )
+                else:
+                    logger.info(
+                        f"  Log2 [{name.split('.')[-2]}] per-channel C={b.numel()}: "
+                        f"log2_base(mean/min/max)=("
+                        f"{b.mean().item():.2f}/"
+                        f"{b.min().item():.2f}/"
+                        f"{b.max().item():.2f})"
+                    )
+    if count:
+        logger.info(f"  共 {count} 个 SparseLog2FakeQuantize 完成校准。")
 
 
 # 临时修补 mmcv 的 Conv/Linear 包装层，使 torch.fx 追踪时不触发 Proxy 布尔判断报错
@@ -447,27 +717,79 @@ def manual_quantize_nontraceable(module, logger, module_name="unknown", act_obse
 # 稀疏卷积量化：为 SparseEncoder (spconv v1.x) 提供 FakeQuant 支持
 # ============================================================================
 
-def _create_spconv_fakeq_pair(act_observer_cls=None):
-    """创建 per-channel 量化的 FakeQuant 对，适用于稀疏卷积。
-    兼容不同版本 MQBench（不依赖 symmetric_range kwarg）。
-    稀疏卷积权重形状为 [K,K,K,C_in,C_out]，ch_axis=4（输出通道维度）。
+def _replace_feature(sparse_tensor: SparseConvTensor,
+                     new_features: torch.Tensor) -> SparseConvTensor:
+    """SparseConvTensor の features を新テンソルで置き換えて返す。
+
+    Round 8 修复：避免 in-place 改写原始 SparseConvTensor。
+    spconv v2 用 replace_feature()，v1.x 手动构造新 tensor。
+    """
+    if hasattr(sparse_tensor, 'replace_feature'):
+        return sparse_tensor.replace_feature(new_features)
+    new_tensor = SparseConvTensor(
+        new_features,
+        sparse_tensor.indices,
+        sparse_tensor.spatial_shape,
+        sparse_tensor.batch_size,
+    )
+    for attr in ('grid', 'voxel_num', 'indice_dict', 'benchmark', 'benchmark_record'):
+        if hasattr(sparse_tensor, attr):
+            setattr(new_tensor, attr, getattr(sparse_tensor, attr))
+    return new_tensor
+
+
+def _create_spconv_fakeq_pair(act_observer_cls=None, act_per_channel=False,
+                              no_act_quant=False):
+    """创建 FakeQuant 对，适用于稀疏卷积。
+
+    Round 8 新增：
+      - no_act_quant=True → W8A16 模式，只量化权重，激活保持 FP
+      - KLDivergenceObserver 自动注入 sparse_mode=True（稀疏感知校准）
+
+    Round 9 新增：
+      - act_observer_cls=SparseLog2FakeQuantize → 直接构造 log2 量化节点，
+        跳过 MQBench LearnableFakeQuantize 包装
 
     Args:
-        act_observer_cls: 激活 Observer 类（默认 EMAMinMaxObserver）。
-            可选 MSEObserver / EMAQuantileObserver 以缓解离群点导致的范围浪费。
+        act_observer_cls: 激活 Observer 类或哨兵（默认 EMAMinMaxObserver）
+        act_per_channel:  是否逐通道量化激活（features [N,C]，按 C 维）
+        no_act_quant:     W8A16 模式，激活不量化
     """
     if act_observer_cls is None:
         act_observer_cls = EMAMinMaxObserver
+
+    # 权重始终 per-channel INT8（稀疏卷积权重 [K,K,K,C_in,C_out]，ch_axis=4）
     w_params = QuantizeScheme(
         symmetry=True, per_channel=True, pot_scale=False, bit=8
     ).to_observer_params()
     w_params['quant_min'] = -127
     w_params['ch_axis'] = 4
+    weight_fq = LearnableFakeQuantize(observer=MinMaxObserver, **w_params)
+
+    # W8A16：激活不量化
+    if no_act_quant:
+        return weight_fq, None
+
+    # ★ Round 9：Log2 量化（哨兵路径）
+    if act_observer_cls is SparseLog2FakeQuantize:
+        act_fq = SparseLog2FakeQuantize(
+            per_channel=act_per_channel,
+            ch_axis=1,
+        )
+        return weight_fq, act_fq
+
+    # 标准 MQBench 路径
     a_params = QuantizeScheme(
-        symmetry=True, per_channel=False, pot_scale=False, bit=8
+        symmetry=True, per_channel=act_per_channel, pot_scale=False, bit=8
     ).to_observer_params()
     a_params['quant_min'] = -127
-    weight_fq = LearnableFakeQuantize(observer=MinMaxObserver, **w_params)
+    if act_per_channel:
+        a_params['ch_axis'] = 1
+
+    # ★ Round 8：KLDivergenceObserver 自动启用 sparse_mode
+    if act_observer_cls is KLDivergenceObserver:
+        a_params['sparse_mode'] = True
+
     act_fq = LearnableFakeQuantize(observer=act_observer_cls, **a_params)
     return weight_fq, act_fq
 
@@ -475,16 +797,24 @@ def _create_spconv_fakeq_pair(act_observer_cls=None):
 class _QuantizedSparseConv(SparseModule):
     """SparseConvolution + FakeQuantize（spconv v1.x 稀疏卷积量化）。
 
-    继承 SparseModule 以确保 SparseSequential 正确路由 SparseConvTensor。
-    量化方式：
-      - 激活量化：对 SparseConvTensor.features（标准密集张量）施加 FakeQuant
-      - 权重量化：临时替换 weight.data 为 FakeQuant 后的版本，调用原始 forward
+    Round 8 修复：
+      1. features 更新通过 _replace_feature() 完成，避免 in-place 改写
+      2. weight 还原用 try-finally 保证异常安全
+      3. 支持 W8A16（act_fake_quant=None）
+
+    Round 9 新增：
+      4. act_fake_quant 可以是 SparseLog2FakeQuantize 实例
     """
 
-    def __init__(self, original, act_observer_cls=None):
+    def __init__(self, original, act_observer_cls=None, act_per_channel=False,
+                 no_act_quant=False):
         super().__init__()
         self.conv = original
-        self.weight_fake_quant, self.act_fake_quant = _create_spconv_fakeq_pair(act_observer_cls)
+        self.weight_fake_quant, self.act_fake_quant = _create_spconv_fakeq_pair(
+            act_observer_cls=act_observer_cls,
+            act_per_channel=act_per_channel,
+            no_act_quant=no_act_quant,
+        )
 
     @property
     def weight(self):
@@ -496,36 +826,70 @@ class _QuantizedSparseConv(SparseModule):
 
     def forward(self, input):
         assert isinstance(input, SparseConvTensor)
-        # 量化激活值（features 是标准密集张量 [N, C]）
-        input.features = self.act_fake_quant(input.features)
-        # 量化权重：临时替换后调用原始 forward
-        saved_weight = self.conv.weight.data
-        self.conv.weight.data = self.weight_fake_quant(saved_weight)
-        output = self.conv(input)
-        self.conv.weight.data = saved_weight
+
+        # ★ 激活量化（_replace_feature 避免 in-place 改写）
+        if self.act_fake_quant is not None:
+            quant_feats = self.act_fake_quant(input.features)
+            input = _replace_feature(input, quant_feats)
+
+        # ★ 权重量化（try-finally 保证异常时也还原）
+        saved_weight = self.conv.weight.data.clone()
+        try:
+            self.conv.weight.data = self.weight_fake_quant(saved_weight)
+            output = self.conv(input)
+        finally:
+            self.conv.weight.data = saved_weight
         return output
 
 
-def manual_quantize_sparse(module, logger, module_name="unknown", act_observer_cls=None):
+def manual_quantize_sparse(
+        module, logger, module_name="unknown", act_observer_cls=None,
+        act_per_channel=False, no_act_quant=False,
+):
     """对 SparseEncoder 中的稀疏卷积层插入 FakeQuantize 节点。
 
     替换所有 SparseConvolution (SubMConv3d/SparseConv3d) 为带 FakeQuant 的包装版本。
     BatchNorm1d / ReLU 等非稀疏层不受影响。
+
+    Round 8+9 新增 Args:
+        no_act_quant: W8A16 模式，只量化权重，激活保持 FP
     """
     replacements = []
     for name, child in list(module.named_modules()):
         if isinstance(child, SparseConvolution) and not isinstance(
-            child, _QuantizedSparseConv
+                child, _QuantizedSparseConv
         ):
-            replacements.append((name, _QuantizedSparseConv(child, act_observer_cls)))
+            replacements.append((
+                name,
+                _QuantizedSparseConv(
+                    child,
+                    act_observer_cls=act_observer_cls,
+                    act_per_channel=act_per_channel,
+                    no_act_quant=no_act_quant,
+                )
+            ))
 
     for name, replacement in replacements:
         _set_nested_attr(module, name, replacement)
 
-    fq_count = len(replacements) * 2
+    is_log2 = (act_observer_cls is SparseLog2FakeQuantize)
+    is_kl = (act_observer_cls is KLDivergenceObserver)
+    obs_name = (act_observer_cls.__name__ if act_observer_cls else "EMAMinMaxObserver")
+    act_scheme = "per-channel" if act_per_channel else "per-tensor"
+    fq_count = len(replacements) * (1 if no_act_quant else 2)
+
+    if no_act_quant:
+        mode_str = "W8A16（权重only，激活FP）"
+    elif is_log2:
+        mode_str = f"Log2量化, {act_scheme}"
+    elif is_kl:
+        mode_str = f"{obs_name} [sparse_aware=ON], {act_scheme}"
+    else:
+        mode_str = f"{obs_name}, {act_scheme}"
+
     logger.info(
         f"  ↪ 稀疏卷积量化 {module_name}: 替换 {len(replacements)} 个 SparseConv，"
-        f"插入 {fq_count} 个 FakeQuant 节点"
+        f"插入 {fq_count} 个 FakeQuant 节点 ({mode_str})"
     )
     return module
 
@@ -545,19 +909,20 @@ def manual_quantize_sparse(module, logger, module_name="unknown", act_observer_c
 _QUANTIZABLE_SUBMODULE_KEYS = [
     # (attr_path_on_model, display_name)
     # camera branch
-    ("encoders.camera.backbone",    "camera/backbone"),
-    ("encoders.camera.neck",        "camera/neck"),
-    ("encoders.camera.vtransform",  "camera/vtransform"),
+    ("encoders.camera.backbone", "camera/backbone"),
+    ("encoders.camera.neck", "camera/neck"),
+    ("encoders.camera.vtransform", "camera/vtransform"),
     # lidar branch
-    ("encoders.lidar.backbone",     "lidar/backbone"),
+    ("encoders.lidar.backbone", "lidar/backbone"),
     # fuser
-    ("fuser",                       "fuser"),
+    ("fuser", "fuser"),
     # decoder
-    ("decoder.backbone",            "decoder/backbone"),
-    ("decoder.neck",                "decoder/neck"),
+    ("decoder.backbone", "decoder/backbone"),
+    ("decoder.neck", "decoder/neck"),
     # heads (TransFusionHead)
-    ("decoder.heads.object",        "heads/object"),
+    ("decoder.heads.object", "heads/object"),
 ]
+
 
 # heads 单独遍历（数量不定）
 
@@ -593,8 +958,16 @@ def _set_nested_attr(obj, key: str, value):
         setattr(obj, last, value)
 
 
-def apply_selective_ptq(model, backend_type, logger, skip_modules=None,
-                       act_observer_cls=None, vtransform_observer_cls=None):
+def apply_selective_ptq(
+        model,
+        backend_type,
+        logger,
+        skip_modules=None,
+        act_observer_cls=None,
+        vtransform_observer_cls=None,
+        sparse_act_per_channel=False,
+        no_lidar_act_quant=False,
+):
     """
     对模型中全部可量化子模块插入 FakeQuantize 节点。
 
@@ -603,28 +976,17 @@ def apply_selective_ptq(model, backend_type, logger, skip_modules=None,
       2. 手动 FakeQuant 包装 Conv2d/Linear（fx 追踪失败的密集模块）
       3. 手动 FakeQuant 包装 SparseConvolution（稀疏卷积模块）
 
-    Args:
-        model (nn.Module): 原始浮点模型
-        backend_type (BackendType): 目标后端（TensorRT）
-        skip_modules (list[str] | None): 要跳过的模块 display_name 列表
-        act_observer_cls: 稀疏卷积激活 Observer 类（默认 EMAMinMaxObserver）
-        vtransform_observer_cls: vtransform 激活 Observer 类（默认 None → EMAMinMaxObserver）。
-            可设置为 KLDivergenceObserver 等，仅作用于 camera/vtransform 模块。
-        logger: 日志记录器
-
-    Returns:
-        nn.Module: 已对全部可量化子模块插入 FakeQuantize 节点的模型
+    Round 8+9 新增 Args:
+        no_lidar_act_quant: W8A16 控制实验 —— lidar 只量化权重，激活保持 FP
     """
     success, failed, skipped = [], [], []
 
     def _has_sparse_conv(module):
-        """检查模块是否包含稀疏卷积层。"""
         return any(isinstance(m, SparseConvolution) for m in module.modules())
 
     def _try_quantize(submodule, display_name, attr_key=None, set_back=None):
-        """尝试量化单个子模块，依次尝试三条路径。"""
-        # 判断是否为 vtransform 模块 → 使用专用 observer
         is_vtransform = (display_name == "camera/vtransform")
+        is_lidar = (display_name == "lidar/backbone")
         manual_obs = vtransform_observer_cls if is_vtransform else None
 
         # 路径 1: torch.fx 自动插桩
@@ -647,7 +1009,14 @@ def apply_selective_ptq(model, backend_type, logger, skip_modules=None,
         # 路径 3: 稀疏卷积量化（SparseEncoder 内无 Conv2d，需专用处理）
         if _has_sparse_conv(submodule):
             try:
-                manual_quantize_sparse(submodule, logger, display_name, act_observer_cls)
+                manual_quantize_sparse(
+                    submodule,
+                    logger,
+                    display_name,
+                    act_observer_cls=act_observer_cls,
+                    act_per_channel=sparse_act_per_channel,
+                    no_act_quant=(no_lidar_act_quant and is_lidar),
+                )
                 success.append(f"{display_name} (稀疏)")
                 return
             except Exception as e2:
@@ -687,7 +1056,6 @@ def apply_selective_ptq(model, backend_type, logger, skip_modules=None,
                 skipped.append(f"{display_name} (--skip-modules)")
                 logger.info(f"  ⊘ 跳过子模块: {display_name} (--skip-modules)")
                 continue
-            # 如果已在 _QUANTIZABLE_SUBMODULE_KEYS 中处理过则跳过
             if display_name in success or any(display_name in s for s in success):
                 continue
             _try_quantize(
@@ -702,7 +1070,6 @@ def apply_selective_ptq(model, backend_type, logger, skip_modules=None,
     if failed:
         logger.warning(f"  失败的子模块: {failed}")
 
-    # 标记不量化的部分（仅供日志参考）
     skipped_by_design = [
         "lidar/voxelize  (体素化预处理，非神经网络层)",
         "radar/voxelize  (体素化预处理，如有)",
@@ -713,7 +1080,6 @@ def apply_selective_ptq(model, backend_type, logger, skip_modules=None,
             logger.info(f"  - {item}")
 
     return model, success, failed
-
 
 
 # ============================================================================
@@ -727,7 +1093,7 @@ def _round_ste(x: torch.Tensor) -> torch.Tensor:
 
 
 def _fake_quant_weight(w: torch.Tensor, clip_min: torch.Tensor, clip_max: torch.Tensor,
-                        ch_axis: int = 4, qmin: int = -127, qmax: int = 127) -> torch.Tensor:
+                       ch_axis: int = 4, qmin: int = -127, qmax: int = 127) -> torch.Tensor:
     """可微 per-channel fake quantization with learnable clipping.
 
     Args:
@@ -879,48 +1245,60 @@ def optimize_lwc_sparse(model, logger,
 # 校准阶段
 # ============================================================================
 
+def _sync_log2_quantizer_state(model, observe: bool):
+    """SparseLog2FakeQuantize と MQBench lifecycle の同期。（Round 9）
+
+    MQBench の enable_calibration / enable_quantization は LearnableFakeQuantize
+    しか認識しないため、SparseLog2FakeQuantize は別途状態を同期する必要がある。
+
+    observe=True  → 校准: observer ON,  fake_quant OFF
+    observe=False → 量化: observer OFF, fake_quant ON
+    """
+    for m in model.modules():
+        if isinstance(m, SparseLog2FakeQuantize):
+            if observe:
+                m.enable_observer()
+                m.disable_fake_quant()
+            else:
+                m.disable_observer()
+                m.enable_fake_quant()
+
+
 def run_calibration(model, data_loader, num_batches, logger):
     """
-    MinMax PTQ 校准：在校准数据上前向推理，收集各层激活值的 min/max。
+    PTQ 校准：在校准数据上前向推理，收集各层激活值统计量。
+
+    Round 9 更新：SparseLog2FakeQuantize 节点与 MQBench 状态同步。
 
     流程：
-      enable_calibration → 运行 num_batches 个 batch → enable_quantization
-
-    Args:
-        model: 已插入 FakeQuantize 节点的模型
-        data_loader: 数据加载器（建议用训练集子集）
-        num_batches (int): 校准 batch 数（32~512 通常已足够）
-        logger: 日志记录器
+      enable_calibration → sync_log2(observe=True) →
+      运行 num_batches → enable_quantization → sync_log2(observe=False)
     """
-    logger.info(f"开始 MinMax 校准，共使用 {num_batches} 个 batch ...")
+    logger.info(f"开始校准，共使用 {num_batches} 个 batch ...")
 
-    # 启用 Observer（记录 min/max），禁用 FakeQuant，进入“收集统计量”模式
     enable_calibration(model)
+    _sync_log2_quantizer_state(model, observe=True)  # ★ Round 9
     model.eval()
 
     with torch.no_grad():
         for i, data in enumerate(data_loader):
             if i >= num_batches:
-                # 达到指定校准 batch 数后退出
                 break
             try:
-                # 前向推理：仅用于统计激活分布，不计算梯度
                 model(return_loss=False, rescale=True, **data)
             except Exception as e:
-                # 单个 batch 失败时跳过，避免影响整体校准
                 logger.warning(f"  校准 batch {i} 出错（已跳过）: {e}")
                 continue
             if (i + 1) % 10 == 0:
-                # 定期打印进度，便于监控校准进展
                 logger.info(f"  校准进度: {i + 1}/{num_batches}")
 
-    logger.info("MinMax 校准完成，scale/zero_point 已确定。")
+    logger.info("校准完成，scale/zero_point 已确定。")
 
-    # 报告 KL 散度 Observer 的阈值选择结果
     _report_kl_observer_results(model, logger)
+    _report_log2_quantizer_results(model, logger)  # ★ Round 9
 
-    # 冻结 Observer 的统计量，启用 FakeQuant，切换到量化推理模式
     enable_quantization(model)
+    _sync_log2_quantizer_state(model, observe=False)  # ★ Round 9
     logger.info("模型已切换为量化推理模式（FakeQuant 激活）。")
 
 
@@ -932,25 +1310,56 @@ def _report_kl_observer_results(model, logger):
         if isinstance(module, KLDivergenceObserver):
             if module.histogram.sum() > 0:
                 threshold, kl = module._find_optimal_threshold()
-                hist_max = module.hist_max.item()
-                compression = 1.0 - (threshold / hist_max) if hist_max > 0 else 0
-                # Compute what percentile the threshold covers
-                hist_np = module.histogram.float().cpu().numpy()
-                cumsum = np.cumsum(hist_np)
-                total = cumsum[-1]
-                thresh_bin = int(threshold / hist_max * len(hist_np)) if hist_max > 0 else len(hist_np)
-                thresh_bin = min(thresh_bin, len(hist_np) - 1)
-                pct_covered = cumsum[thresh_bin] / total * 100 if total > 0 else 100.0
-                msg = (f"  KL [{name.split('.')[-4]}."
-                       f"{name.split('.')[-3]}]: "
-                       f"T={threshold:.4f}, max={hist_max:.4f}, "
-                       f"KL={kl:.6f}, compress={compression*100:.1f}%, "
-                       f"covers={pct_covered:.2f}%")
-                print(msg, flush=True)
+                name_parts = name.split('.')
+                short_name = ".".join(name_parts[-2:]) if len(name_parts) >= 2 else name
+
+                if module.ch_axis == -1:
+                    hist_max = module.hist_max.item()
+                    compression = 1.0 - (threshold / hist_max) if hist_max > 0 else 0
+                    # Compute what percentile the threshold covers
+                    hist_np = module.histogram.float().cpu().numpy()
+                    cumsum = np.cumsum(hist_np)
+                    total = cumsum[-1]
+                    thresh_bin = int(threshold / hist_max * len(hist_np)) if hist_max > 0 else len(hist_np)
+                    thresh_bin = min(thresh_bin, len(hist_np) - 1)
+                    pct_covered = cumsum[thresh_bin] / total * 100 if total > 0 else 100.0
+                    msg = (f"  KL [{short_name}]: "
+                           f"T={threshold:.4f}, max={hist_max:.4f}, "
+                           f"KL={kl:.6f}, compress={compression * 100:.1f}%, "
+                           f"covers={pct_covered:.2f}%")
+                    print(msg, flush=True)
+                else:
+                    # per-channel：打印统计摘要，避免刷屏
+                    threshold_t = torch.as_tensor(threshold, dtype=torch.float32)
+                    kl_t = torch.as_tensor(kl, dtype=torch.float32)
+                    hist_max_t = module.hist_max.detach().float().cpu()
+                    valid = hist_max_t > 0
+                    compression = torch.zeros_like(hist_max_t)
+                    compression[valid] = 1.0 - threshold_t[valid] / hist_max_t[valid]
+
+                    msg = (
+                        f"  KL [{short_name}] (per-channel, C={threshold_t.numel()}): "
+                        f"T(mean/med/max)=({threshold_t.mean().item():.4f}/"
+                        f"{threshold_t.median().item():.4f}/{threshold_t.max().item():.4f}), "
+                        f"KL(mean/max)=({kl_t.mean().item():.6f}/{kl_t.max().item():.6f}), "
+                        f"compress(mean/max)=({(compression.mean().item() * 100):.1f}%/"
+                        f"{(compression.max().item() * 100):.1f}%)"
+                    )
+                    print(msg, flush=True)
                 # Also show the qparams that will be set
                 module.calculate_qparams()
-                print(f"    -> range: [{module.min_val.item():.4f}, {module.max_val.item():.4f}]",
-                      flush=True)
+                if module.min_val.numel() == 1:
+                    print(
+                        f"    -> range: [{module.min_val.item():.4f}, {module.max_val.item():.4f}]",
+                        flush=True
+                    )
+                else:
+                    t = module.max_val.detach().abs().float().cpu()
+                    print(
+                        f"    -> per-channel range: C={t.numel()}, "
+                        f"T(mean/med/max)=({t.mean().item():.4f}/{t.median().item():.4f}/{t.max().item():.4f})",
+                        flush=True
+                    )
                 kl_count += 1
     if kl_count > 0:
         logger.info(f"  共 {kl_count} 个 KLDivergenceObserver 完成阈值搜索。")
@@ -960,54 +1369,50 @@ def _report_kl_observer_results(model, logger):
 # 构建模型
 # ============================================================================
 
-def build_ptq_model(cfg, logger, skip_modules=None, act_observer_cls=None,
-                    vtransform_observer_cls=None):
+def build_ptq_model(
+        cfg,
+        logger,
+        skip_modules=None,
+        act_observer_cls=None,
+        vtransform_observer_cls=None,
+        sparse_act_per_channel=False,
+        no_lidar_act_quant=False,
+):
     """
     构建浮点模型，加载预训练权重，再对可量化子模块进行 PTQ 准备。
 
-    Args:
-        cfg: mmcv Config 对象
-        logger: 日志记录器
-        skip_modules (list[str] | None): 要跳过的模块 display_name 列表
-        act_observer_cls: 稀疏卷积激活 Observer 类（默认 EMAMinMaxObserver）
-        vtransform_observer_cls: vtransform 激活 Observer 类（默认 None → EMAMinMaxObserver）
-
-    Returns:
-        nn.Module: 已对可量化子模块插入 FakeQuantize 节点的模型
+    Round 8+9 新增 Args:
+        no_lidar_act_quant: W8A16 控制实验，lidar 只量化权重，激活保持 FP
     """
-    # 1. 构建浮点模型（与 test.py 完全对齐）
     cfg.model.pretrained = None
     cfg.model.train_cfg = None
     model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
-    # 注意：不再额外调用 model.init_weights()，BEVFusion.__init__ 已经调用过
 
-    # 1.5 FP16 混合精度包装（与 test.py 对齐）
     fp16_cfg = cfg.get("fp16", None)
     if fp16_cfg is not None:
         from mmcv.runner import wrap_fp16_model
         wrap_fp16_model(model)
         logger.info("已启用 FP16 混合精度（与 test.py 对齐）。")
 
-    # 2. 加载预训练权重（使用 load_checkpoint 与 test.py 一致）
     if cfg.get("load_from", None):
         logger.info(f"加载预训练权重: {cfg.load_from}")
         from mmcv.runner import load_checkpoint
         checkpoint = load_checkpoint(model, cfg.load_from, map_location="cpu")
         logger.info("预训练权重加载完成（load_checkpoint）。")
 
-    # 3. SyncBN（如配置需要）
     if cfg.get("sync_bn", None):
         if not isinstance(cfg["sync_bn"], dict):
             cfg["sync_bn"] = dict(exclude=[])
         model = convert_sync_batchnorm(model, exclude=cfg["sync_bn"]["exclude"])
 
-    # 4. 选择性 PTQ 准备（仅对可量化子模块插入 FakeQuantize 节点）
     backend_type = BackendType.Tensorrt
-    logger.info("开始对可量化子模块进行 PTQ 准备 (MinMax + TensorRT INT8) ...")
+    logger.info("开始对可量化子模块进行 PTQ 准备 (TensorRT INT8) ...")
     model, success, failed = apply_selective_ptq(
         model, backend_type, logger, skip_modules=skip_modules,
         act_observer_cls=act_observer_cls,
-        vtransform_observer_cls=vtransform_observer_cls
+        vtransform_observer_cls=vtransform_observer_cls,
+        sparse_act_per_channel=sparse_act_per_channel,
+        no_lidar_act_quant=no_lidar_act_quant,
     )
 
     return model, success, failed
@@ -1022,7 +1427,7 @@ def evaluate_quantized_model(model, data_loader, dataset, cfg, logger):
     对量化模型进行完整评估，输出 NDS / mAP 指标。
     """
     logger.info("开始评估量化模型（验证集推理 + NDS/mAP 计算）...")
-    
+
     outputs = single_gpu_test(model, data_loader)
     logger.info(f"量化模型推理完成，共处理 {len(outputs)} 个样本。")
 
@@ -1047,14 +1452,14 @@ def evaluate_quantized_model(model, data_loader, dataset, cfg, logger):
 
 # 模块路径映射（诊断 + 参数分析共用）
 _ALL_MODULE_PATHS = [
-    ("camera/backbone",   "encoders.camera.backbone"),
-    ("camera/neck",       "encoders.camera.neck"),
+    ("camera/backbone", "encoders.camera.backbone"),
+    ("camera/neck", "encoders.camera.neck"),
     ("camera/vtransform", "encoders.camera.vtransform"),
-    ("lidar/backbone",    "encoders.lidar.backbone"),
-    ("fuser",             "fuser"),
-    ("decoder/backbone",  "decoder.backbone"),
-    ("decoder/neck",      "decoder.neck"),
-    ("heads/object",      "heads.object"),
+    ("lidar/backbone", "encoders.lidar.backbone"),
+    ("fuser", "fuser"),
+    ("decoder/backbone", "decoder.backbone"),
+    ("decoder/neck", "decoder.neck"),
+    ("heads/object", "heads.object"),
 ]
 
 
@@ -1140,6 +1545,7 @@ def diagnose_quantization_effect(model, data_loader, logger, num_samples=5):
 
     class _OutputCapture:
         """Forward hook，捕获模块输出的第一个 Tensor。"""
+
         def __init__(self):
             self.outputs = []
 
@@ -1337,24 +1743,33 @@ def main():
         default=500,
         help="LWC optimization iterations per layer (default: 500)",
     )
-    # 稀疏卷积激活 Observer 选择
+    # 稀疏卷积激活 Observer / 量化器选择
     parser.add_argument(
         "--act-observer",
         type=str,
         default="ema_minmax",
-        choices=["ema_minmax", "mse", "ema_quantile", "kl_divergence"],
+        choices=["ema_minmax", "mse", "ema_quantile", "kl_divergence", "log2"],
         help="activation observer for sparse conv (lidar/backbone) quantization. "
              "ema_minmax: EMA MinMax (default, baseline); "
-             "mse: MSE-optimal range (recommended for heavy-tailed distributions); "
-             "ema_quantile: percentile-based clipping (threshold=0.99999); "
-             "kl_divergence: KL-divergence based optimal truncation",
+             "mse: MSE-optimal range; "
+             "ema_quantile: percentile-based clipping; "
+             "kl_divergence: KL-divergence optimal truncation + sparse_mode (Round 8); "
+             "log2: log2-domain quantization, constant relative error (Round 9, "
+             "recommended for log-normal sparse activations near 0)",
+    )
+    parser.add_argument(
+        "--sparse-act-mode",
+        type=str,
+        default="per_tensor",
+        choices=["per_tensor", "per_channel"],
+        help="activation quantization granularity for lidar/backbone sparse features [N,C]. "
+             "per_tensor: one scale for all channels (baseline); "
+             "per_channel: one scale per channel C.",
     )
     parser.add_argument(
         "--calib-shuffle",
         action="store_true",
-        help="shuffle calibration data for better scene diversity (default: False, sequential). "
-             "Recommended when --calib-batches < total_val_size: sequential order means only "
-             "the first N scenes are used; shuffle ensures coverage across all scenes.",
+        help="shuffle calibration data for better scene diversity (default: False, sequential).",
     )
     # vtransform 专用激活 Observer 选择
     parser.add_argument(
@@ -1363,10 +1778,15 @@ def main():
         default=None,
         choices=["ema_minmax", "mse", "ema_quantile", "kl_divergence"],
         help="activation observer specifically for camera/vtransform module. "
-             "If not set, uses the same as other manual-path modules (EMAMinMaxObserver). "
-             "kl_divergence: KL-divergence based optimal truncation (similar to TRT entropy calibrator); "
-             "mse: MSE-optimal range; "
-             "ema_quantile: percentile-based clipping (threshold=0.99999)",
+             "kl_divergence: recommended (Round 5, resolves vtransform quantization bottleneck).",
+    )
+    # Round 8+9：W8A16 控制实验
+    parser.add_argument(
+        "--no-lidar-act-quant",
+        action="store_true",
+        help="W8A16 control experiment: quantize lidar/backbone weights only, "
+             "keep activations in FP (Round 8). Isolates weight vs activation "
+             "quantization contribution to NDS degradation.",
     )
     args, opts = parser.parse_known_args()
 
@@ -1408,9 +1828,10 @@ def main():
     # ------------------------------------------------------------------
     # Step 1: 构建校准数据集
     # ------------------------------------------------------------------
-    # 使用验证集做校准（test_mode=True，与推理流程一致，不含 GTDepth 等训练专属字段）
-    logger.info("构建校准数据集（使用验证集，test_mode=True）...")
-    calib_cfg = cfg.data.val.copy()
+    # 使用训练集做校准（test_mode=True 关闭数据增强，避免过拟合到验证集）
+    # PTQ 校准的目的是学习权重/激活的统计分布，应该使用训练集而非验证集
+    logger.info("构建校准数据集（使用训练集，test_mode=True，关闭数据增强）...")
+    calib_cfg = cfg.data.train.copy()
     calib_cfg.test_mode = True
     calib_dataset = build_dataset(calib_cfg)
     calib_shuffle = args.calib_shuffle
@@ -1450,6 +1871,7 @@ def main():
         "mse": MSEObserver,
         "ema_quantile": EMAQuantileObserver,
         "kl_divergence": KLDivergenceObserver,
+        "log2": SparseLog2FakeQuantize,  # ★ Round 9
     }
     VTRANSFORM_OBSERVER_MAP = {
         "ema_minmax": EMAMinMaxObserver,
@@ -1463,6 +1885,7 @@ def main():
         "mse": "MSEObserver (MSE-optimal range)",
         "ema_quantile": "EMAQuantileObserver (percentile clipping)",
         "kl_divergence": "KLDivergenceObserver (KL 散度最优截断)",
+        "log2": "SparseLog2FakeQuantize (对数域量化，Round 9)",
     }[args.act_observer]
     # vtransform observer
     vt_obs_cls = None
@@ -1475,13 +1898,25 @@ def main():
             "ema_quantile": "EMAQuantileObserver (percentile clipping)",
             "kl_divergence": "KLDivergenceObserver (KL 散度最优截断)",
         }[args.vtransform_observer]
-    logger.info(f"构建 PTQ 模型（选择性 MinMax 量化，稀疏卷积激活 Observer: {act_obs_name}）...")
+    sparse_act_per_channel = (args.sparse_act_mode == "per_channel")
+    sparse_act_scheme_name = "per-channel" if sparse_act_per_channel else "per-tensor"
+    is_log2 = (act_obs_cls is SparseLog2FakeQuantize)
+    is_kl_sparse = (act_obs_cls is KLDivergenceObserver)
+
+    logger.info(
+        "构建 PTQ 模型（选择性量化，"
+        f"稀疏激活: {act_obs_name}, 粒度: {sparse_act_scheme_name}）..."
+    )
     if vt_obs_cls:
         logger.info(f"  vtransform 激活 Observer: {vt_obs_name}")
+    if getattr(args, 'no_lidar_act_quant', False):
+        logger.info("  ★ W8A16 控制实验：lidar/backbone 激活不量化（仅权重量化）")
     model, quant_success, quant_failed = build_ptq_model(
         cfg, logger, skip_modules=args.skip_modules,
         act_observer_cls=act_obs_cls,
         vtransform_observer_cls=vt_obs_cls,
+        sparse_act_per_channel=sparse_act_per_channel,
+        no_lidar_act_quant=getattr(args, 'no_lidar_act_quant', False),
     )
     model = MMDataParallel(model.cuda(), device_ids=[0])
     logger.info("模型已移动到 GPU（MMDataParallel）。")
@@ -1504,17 +1939,22 @@ def main():
     _skipped_set = set(args.skip_modules)
     total_possible = len(_EXPECTED_QUANT - _skipped_set)
     coverage_pct = len(quant_success) / max(total_possible, 1) * 100
+    w8a16_flag = getattr(args, 'no_lidar_act_quant', False)
 
     logger.info("")
     logger.info("╔══════════════════════════════════════════════════════════════╗")
     logger.info("║             ★ 量化摘要 — 校准即将开始，请检查！ ★              ║")
     logger.info("╠══════════════════════════════════════════════════════════════╣")
-    logger.info(f"║  成功量化: {len(quant_success):>2d} 个模块  →  {', '.join(quant_success) if quant_success else '(无)'}")
-    logger.info(f"║  量化失败: {len(quant_failed):>2d} 个模块  →  {', '.join(quant_failed) if quant_failed else '(无)'}")
+    logger.info(
+        f"║  成功量化: {len(quant_success):>2d} 个模块  →  {', '.join(quant_success) if quant_success else '(无)'}")
+    logger.info(
+        f"║  量化失败: {len(quant_failed):>2d} 个模块  →  {', '.join(quant_failed) if quant_failed else '(无)'}")
     logger.info(f"║  主动跳过: {', '.join(args.skip_modules) if args.skip_modules else '(无)'}")
     logger.info(f"║  覆盖率  : {coverage_pct:.0f}%  ({len(quant_success)}/{total_possible} 个可量化模块)")
-    logger.info(f"║  稀疏激活: {act_obs_name}")
+    logger.info(f"║  稀疏激活: {act_obs_name}{' [sparse_aware=ON]' if is_kl_sparse else ''}")
+    logger.info(f"║  稀疏粒度: {sparse_act_scheme_name}")
     logger.info(f"║  VT激活  : {vt_obs_name}")
+    logger.info(f"║  W8A16   : {'ON (lidar激活保持FP，仅权重量化)' if w8a16_flag else 'OFF (正常W8A8)'}")
     calib_desc = f"{args.calib_batches} batch, {'shuffle=True（多场景）' if args.calib_shuffle else 'shuffle=False（顺序，仅前几场景）'}"
     logger.info(f"║  校准配置: {calib_desc}")
     if args.lwc:
@@ -1539,7 +1979,8 @@ def main():
     # ------------------------------------------------------------------
     # Step 3: MinMax 校准
     # ------------------------------------------------------------------
-    logger.info(f"MinMax 校准阶段：{args.calib_batches} 个 batch，{'随机采样' if args.calib_shuffle else '顺序采样（仅前几个场景）'}")
+    logger.info(
+        f"MinMax 校准阶段：{args.calib_batches} 个 batch，{'随机采样' if args.calib_shuffle else '顺序采样（仅前几个场景）'}")
     run_calibration(model, calib_loader, num_batches=args.calib_batches, logger=logger)
 
     # ------------------------------------------------------------------
@@ -1565,9 +2006,10 @@ def main():
         "ptq_method": "MinMax" + ("+LWC" if args.lwc else ""),
         "backend": "TensorRT",
         "sparse_act_observer": args.act_observer,
+        "sparse_act_mode": args.sparse_act_mode,
         "vtransform_act_observer": args.vtransform_observer or "ema_minmax",
         "quantized_modules": [k for k, _ in _QUANTIZABLE_SUBMODULE_KEYS]
-        + ["heads/*"],
+                             + ["heads/*"],
         "skipped_modules": [
             "camera/vtransform",
             "lidar/voxelize",

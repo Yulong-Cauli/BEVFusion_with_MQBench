@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//tmp/**)",
+      "Bash(\"D:\\\\Research\\\\Replication\\\\BEVFusion_with_MQBench\\\\docs\\\\RESULTS_LOG.md\")"
+    ]
+  }
+}

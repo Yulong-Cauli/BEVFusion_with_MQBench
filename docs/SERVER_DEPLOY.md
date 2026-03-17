@@ -1,29 +1,45 @@
-# 服务器部署与运行手册（PTQ 消融实验）
+# 服务器部署与运行手册
 
-> **目标**：在服务器（4×RTX 3090，完整 nuScenes trainval 6019帧）上运行全部 PTQ 消融实验  
-> **前提**：FP32 baseline（NDS=0.7069）已完成，**无需重测**  
-> **新实验**：PTQ 三路径量化消融（8/8、6/8、7/8×2），4 张 3090 并行，约 3 小时
+### 本地 PowerShell 环境初始化
+```powershell
+$env:PYTHONUTF8="1"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+conda activate bevfusion
+cd D:\Research\Replication\BEVFusion_with_MQBench
+```
+
+### 服务器 Bash 环境初始化
+```bash
+conda activate bevfusion_mqbench
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+export LD_LIBRARY_PATH=$(python -c "import torch,os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"):$LD_LIBRARY_PATH
+```
 
 ---
 
-## ⚠️ 服务器命令规范（必读）
+## ⚠️ 重要修正：校准集来源（2026-03-13）
 
-**永远不要用 `nohup ... &`。** 用户在 tmux 里直接运行，tmux 本身已经保证断线不丢进程。
+**问题**：之前校准数据从验证集采样（`cfg.data.val`），这是方法论错误，导致过拟合到测试分布。
+**修正**：现在校准数据从**训练集**采样（`cfg.data.train`），并关闭数据增强（`test_mode=True`）。
+**影响**：
+- 已在 Round 5 中重新测试。
+- 之前的 Round 1-4 结果（基于错误的校准集）需要标记为"仅参考"
+
+---
+
+## ⚠️ 服务器命令规范
+
+1、 **永远不要用 `nohup ... &`。** 用户在 tmux 里直接运行，tmux 本身已经保证断线不丢进程。
+
+我希望能看到 tmux 里面的输出。
 
 ✅ **正确写法**（输出直接显示在 tmux，同时写 log 文件）：
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=X python tools/xxx.py ... 2>&1 | tee logs/xxx.log
 ```
 
-✅ **不需要 log 文件时**：
-```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=X python tools/xxx.py ...
-```
-
-❌ **禁止写法**：
-```bash
-nohup python ... > logs/xxx.log 2>&1 &   # 输出不可见，用户无法在 tmux 里看到进度
-```
+2、上传服务器的时候如果涉及多个文件，建议打包成一个压缩包上传，服务器上解压后再运行。避免多次上传和多次 SSH。
 
 ---
 
@@ -654,67 +670,684 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 python tools/quant_ptq_minma
 
 ---
 
-## Round 5：KL Observer + 128 calib batch（2026-03-11）
+## Round 5：KL Observer + 校准集修正（2026-03-13）
 
-> **背景**：Round 3 已证明 512 batch shuffle 相比 128 batch 对 EMAMinMax 几乎无收益（8/8 仅 +2.6%）。
-> 对 KL Observer 而言，因为 KL 本身通过直方图积累多个 batch，128 batch 应已足够（服务器验证集不像 EMAMinMax 那样需要多样性）。
-> Round 5 用 128 calib batch 重跑核心实验，与 Round 4 的 512 batch 对比，验证校准量的影响。
+> **重要修正**：之前 Round 1-4 使用验证集（`cfg.data.val`）进行量化校准，这是方法论错误（导致过拟合到测试分布）。
+> **Round 5 修正**：改用**训练集**（`cfg.data.train` + `test_mode=True`）进行校准，关闭数据增强。
+> **核心实验**：
+>   - GPU#0：7/8 +vt KL（新最优配置，skip lidar）
+>   - GPU#1：8/8 KL(both)（全量化基线）
+>   - GPU#3：7/8 +vt KL + shuffle（加强数据多样性）
+>   - GPU#4：8/8 KL(both) + shuffle
 
-### 运行命令（Round 4 全部完成后再跑）
+### Round 5 Step 0：本地打包上传（PowerShell）
+
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+cd D:\Research\Replication\BEVFusion_with_MQBench
+
+# 打包修正后的代码
+git archive HEAD --format=tar.gz -o code_update_round5.tar.gz `
+    tools/quant_ptq_minmax.py `
+    docs/SERVER_DEPLOY.md `
+    docs/RESULTS_LOG.md
+
+# 上传
+scp code_update_round5.tar.gz yellowstone@10.129.51.101:/tmp/
+
+# 解压
+ssh yellowstone@10.129.51.101 `
+    "cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench && tar xzf /tmp/code_update_round5.tar.gz && rm /tmp/code_update_round5.tar.gz && echo 'Upload OK'"
+```
+
+### Round 5 Step 1：服务器环境确认
 
 ```bash
-# ===== tmux pane for GPU#0: 8/8 KL(both) 128 batch =====
+ssh yellowstone@10.129.51.101
+conda activate bevfusion_mqbench
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+
+# 确认训练集大小（应该显示 ~27000+ 帧）
+python -c "import pickle; d = pickle.load(open('data/nuscenes/nuscenes_infos_train.pkl', 'rb')); print(f'Train frames: {len(d[\"infos\"])}')"
+
+# 准备日志目录
+mkdir -p logs
+```
+
+### Round 5 Step 2：创建 4 个 tmux 会话
+
+```bash
+tmux new-session -d -s round5_gpu0
+tmux new-session -d -s round5_gpu1
+tmux new-session -d -s round5_gpu3
+tmux new-session -d -s round5_gpu4
+```
+
+### Round 5 Step 3：启动 4 个 KL 实验
+
+#### GPU#0 — PTQ 7/8 +vt KL（skip lidar，128 batch 无 shuffle）
+
+```bash
+tmux attach -t round5_gpu0
+conda activate bevfusion_mqbench
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round5_ptq_7of8_vt_kl_calib128 \
+    --skip-modules lidar/backbone \
+    --calib-batches 128 \
+    --act-observer kl_divergence \
+    --vtransform-observer kl_divergence \
+    2>&1 | tee logs/round5_ptq_7of8_vt_kl_calib128.log
+# Ctrl+B D 断开
+```
+
+#### GPU#1 — PTQ 8/8 KL(both)（128 batch 无 shuffle）
+
+```bash
+tmux attach -t round5_gpu1
+conda activate bevfusion_mqbench
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round5_ptq_8of8_kl_both_calib128 \
+    --calib-batches 128 \
+    --act-observer kl_divergence \
+    --vtransform-observer kl_divergence \
+    2>&1 | tee logs/round5_ptq_8of8_kl_both_calib128.log
+# Ctrl+B D 断开
+```
+
+#### GPU#3 — PTQ 7/8 +vt KL + shuffle
+
+```bash
+tmux attach -t round5_gpu3
+conda activate bevfusion_mqbench
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round5_ptq_7of8_vt_kl_calib128_shuffle \
+    --skip-modules lidar/backbone \
+    --calib-batches 128 \
+    --calib-shuffle \
+    --act-observer kl_divergence \
+    --vtransform-observer kl_divergence \
+    2>&1 | tee logs/round5_ptq_7of8_vt_kl_calib128_shuffle.log
+# Ctrl+B D 断开
+```
+
+#### GPU#4 — PTQ 8/8 KL(both) + shuffle
+
+```bash
+tmux attach -t round5_gpu4
+conda activate bevfusion_mqbench
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 \
+python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round5_ptq_8of8_kl_both_calib128_shuffle \
+    --calib-batches 128 \
+    --calib-shuffle \
+    --act-observer kl_divergence \
+    --vtransform-observer kl_divergence \
+    2>&1 | tee logs/round5_ptq_8of8_kl_both_calib128_shuffle.log
+# Ctrl+B D 断开
+```
+
+### Round 5 Step 4：监控进度
+
+```bash
+# 查看所有 tmux 会话
+tmux ls
+
+# 监控某个实验（Ctrl+B D 断开不杀进程）
+tmux attach -t round5_gpu0
+
+# 查看日志末尾
+tail -f logs/round5_ptq_7of8_vt_kl_calib128.log
+```
+
+### Round 5 Step 5：收集结果
+
+#### 在服务器打包
+
+```bash
+tar czf round5_kl_calib128_results.tar.gz \
+    logs/round5_ptq_7of8_vt_kl_calib128.log \
+    logs/round5_ptq_8of8_kl_both_calib128.log \
+    logs/round5_ptq_7of8_vt_kl_calib128_shuffle.log \
+    logs/round5_ptq_8of8_kl_both_calib128_shuffle.log
+
+ls -lh round5_kl_calib128_results.tar.gz
+```
+
+#### 本地拉取（PowerShell）
+
+```powershell
+cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
+
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/round5_kl_calib128_results.tar.gz .
+
+# 解压并查看 NDS 结果
+tar xzf round5_kl_calib128_results.tar.gz
+grep -h "object/nds" round5_ptq_*.log | head -4
+```
+
+### 预期结果对比
+
+| 实验 | 校准集 | Batch | 预期 NDS | 备注 |
+|------|--------|-------|---------|------|
+| 7/8 +vt KL | train | 128 | ~0.70x | 对标 Round4 的 0.7033（可能略微调整） |
+| 8/8 KL(both) | train | 128 | ~0.57x | 对标 Round4 的 0.5750 |
+| 7/8 +vt KL +shuffle | train | 128 | TBD | 加强数据多样性 |
+| 8/8 KL(both) +shuffle | train | 128 | TBD | 全量化 + 多样性 |
+
+**关键点**：
+- 校准集已修正为 `cfg.data.train`（~27000 帧），关闭数据增强
+- 128 batch 对训练集覆盖率约 0.5%，但包含充分的场景多样性
+- 预期精度可能略有变化，但方法论更加正确
+
+---
+## Round 6：LiDAR/backbone 逐通道量化实验（2026-03-14）
+
+> **目标**：验证 `lidar/backbone` 稀疏激活改为逐通道量化（`--sparse-act-mode per_channel`）后，是否显著缓解 8/8 的残余精度瓶颈。  
+> **校准设置**：继续使用训练集（`cfg.data.train` + `test_mode=True`），`--calib-batches 128 --calib-shuffle`。  
+> **兼容性提醒（Round 6 历史）**：当时 `--sparse-act-mode per_channel` 与 `--act-observer kl_divergence` 不兼容；该限制已在 Round 7 实现中解除。
+
+### Round 6 Step 0：本地打包上传（PowerShell）
+
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+cd D:\Research\Replication\BEVFusion_with_MQBench
+
+# 本地直接打包（包含未提交的本地修改，不依赖 git archive）
+Remove-Item code_update_round6.tar.gz -ErrorAction SilentlyContinue
+tar -czf code_update_round6.tar.gz `
+    tools/quant_ptq_minmax.py `
+    docs/SERVER_DEPLOY.md
+
+# 上传到服务器项目目录
+scp code_update_round6.tar.gz yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/
+```
+
+```bash
+# ===== 在服务器执行 =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+tar xzf code_update_round6.tar.gz
+mkdir -p logs
+```
+
+### Round 6 Step 1：实验清单（4 个并行）
+
+| GPU# | 实验名 | 量化配置 | 关键参数 |
+|------|--------|----------|----------|
+| 0 | R6-A | **PTQ6 + lidar(per-channel)**（=7/8，skip vtransform） | `--skip-modules camera/vtransform --act-observer ema_minmax --sparse-act-mode per_channel` |
+| 1 | R6-B | PTQ6 + lidar(per-channel) + vt(KL)（=8/8） | `--vtransform-observer kl_divergence --act-observer ema_minmax --sparse-act-mode per_channel` |
+| 3 | R6-C | PTQ6 + lidar(per-channel) + MSE（=7/8，skip vtransform） | `--skip-modules camera/vtransform --act-observer mse --sparse-act-mode per_channel` |
+| 4 | R6-D | PTQ6 + lidar(per-channel) + vt(KL) + MSE（=8/8） | `--vtransform-observer kl_divergence --act-observer mse --sparse-act-mode per_channel` |
+
+### Round 6 Step 2：启动实验（tmux，各 pane 一条）
+
+```bash
+# ===== tmux pane for GPU#0: R6-A (PTQ6 + lidar per-channel, EMA) =====
 cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
 conda activate bevfusion_mqbench
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load-from pretrained/bevfusion-det.pth \
-    --calib-batches 128 \
-    --vtransform-observer kl_divergence \
-    --act-observer kl_divergence \
-    2>&1 | tee logs/results_server_ptq_8of8_kl_both_128.log
+    --run-dir runs/round6_ptq6_plus_lidar_pc_ema_calib128s \
+    --skip-modules camera/vtransform \
+    --calib-batches 128 --calib-shuffle \
+    --act-observer ema_minmax \
+    --sparse-act-mode per_channel \
+    2>&1 | tee logs/round6_ptq6_plus_lidar_pc_ema_calib128s.log
 ```
 
 ```bash
-# ===== tmux pane for GPU#1: 7/8 +vtransform KL 128 batch =====
+# ===== tmux pane for GPU#1: R6-B (PTQ6 + lidar per-channel + vt KL, EMA) =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load-from pretrained/bevfusion-det.pth \
-    --skip-modules lidar/backbone \
-    --calib-batches 128 \
+    --run-dir runs/round6_ptq6_plus_lidar_pc_vtkl_ema_calib128s \
+    --calib-batches 128 --calib-shuffle \
     --vtransform-observer kl_divergence \
-    2>&1 | tee logs/results_server_ptq_7of8_vt_kl_128.log
+    --act-observer ema_minmax \
+    --sparse-act-mode per_channel \
+    2>&1 | tee logs/round6_ptq6_plus_lidar_pc_vtkl_ema_calib128s.log
 ```
 
 ```bash
-# ===== tmux pane for GPU#3: 7/8 +lidar KL 128 batch =====
+# ===== tmux pane for GPU#3: R6-C (PTQ6 + lidar per-channel, MSE) =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 python tools/quant_ptq_minmax.py \
     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round6_ptq6_plus_lidar_pc_mse_calib128s \
     --skip-modules camera/vtransform \
-    --calib-batches 128 \
-    --act-observer kl_divergence \
-    2>&1 | tee logs/results_server_ptq_7of8_lidar_kl_128.log
+    --calib-batches 128 --calib-shuffle \
+    --act-observer mse \
+    --sparse-act-mode per_channel \
+    2>&1 | tee logs/round6_ptq6_plus_lidar_pc_mse_calib128s.log
 ```
 
-```
+```bash
+# ===== tmux pane for GPU#4: R6-D (PTQ6 + lidar per-channel + vt KL, MSE) =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 python tools/quant_ptq_minmax.py \
->     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
->     --load-from pretrained/bevfusion-det.pth \
->     --calib-batches 128 --calib-shuffle \
->     --vtransform-observer kl_divergence \
->     2>&1 | tee logs/results_server_ptq_8of8_kl_vt_128.log
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round6_ptq6_plus_lidar_pc_vtkl_mse_calib128s \
+    --calib-batches 128 --calib-shuffle \
+    --vtransform-observer kl_divergence \
+    --act-observer mse \
+    --sparse-act-mode per_channel \
+    2>&1 | tee logs/round6_ptq6_plus_lidar_pc_vtkl_mse_calib128s.log
 ```
 
+### Round 6 Step 3：服务器打包结果并传回本地
 
+```bash
+# ===== 在服务器执行 =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+tar czf round6_results.tar.gz \
+    logs/round6_ptq6_plus_lidar_pc_ema_calib128s.log \
+    logs/round6_ptq6_plus_lidar_pc_vtkl_ema_calib128s.log \
+    logs/round6_ptq6_plus_lidar_pc_mse_calib128s.log \
+    logs/round6_ptq6_plus_lidar_pc_vtkl_mse_calib128s.log \
+    runs/round6_ptq6_plus_lidar_pc_ema_calib128s/ptq_minmax_model.pth \
+    runs/round6_ptq6_plus_lidar_pc_vtkl_ema_calib128s/ptq_minmax_model.pth \
+    runs/round6_ptq6_plus_lidar_pc_mse_calib128s/ptq_minmax_model.pth \
+    runs/round6_ptq6_plus_lidar_pc_vtkl_mse_calib128s/ptq_minmax_model.pth
+ls -lh round6_results.tar.gz
+```
 
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/round6_results.tar.gz `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\
 
+cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
+tar xzf round6_results.tar.gz
 
-### Round 5 结果解读指引
+# 可选：仅拉日志（不拉模型）
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/logs/round6_*.log `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\logs\
+```
 
-| 对比 | 意义 |
+### Round 6 结果解读指引
+
+| 对比 | 目标 |
 |------|------|
-| 8/8 KL 128 vs 8/8 KL 512 | KL 对校准量是否敏感（预期 ±0.005 以内） |
-| 7/8+vt KL 128 vs 7/8+vt KL 512 | vtransform KL 的校准量敏感性 |
-| 7/8+lidar KL 128 vs 7/8+lidar KL 512 | lidar KL 的校准量敏感性 |
+| R6-A vs 历史 7/8 +lidar(per-tensor) | 逐通道激活量化是否单独提升 lidar 分支 |
+| R6-B vs 历史 8/8 KL(both) | 在 vt(KL) 已修复前提下，逐通道 lidar 是否抬升 8/8 上限 |
+| R6-C vs R6-A | 在 per-channel 前提下，MSEObserver 是否优于 EMA |
+| R6-D vs R6-B | vt(KL)+lidar(per-channel) 组合下，MSE 是否继续带来收益 |
 
+---
+
+## Round 7：LiDAR/backbone per-channel + KL Observer 实验（2026-03-14）
+
+> **目标**：验证 `lidar/backbone` 稀疏激活在 **逐通道 + KL observer** 下，是否优于 Round 6 的 per-channel + EMA/MSE。  
+> **校准设置**：训练集（`cfg.data.train` + `test_mode=True`），`--calib-batches 128 --calib-shuffle`。  
+> **实现前提**：本轮代码已支持 `--act-observer kl_divergence --sparse-act-mode per_channel`。
+
+### Round 7 Step 0：本地打包上传（PowerShell）
+
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+cd D:\Research\Replication\BEVFusion_with_MQBench
+
+# 本地直接打包（包含未提交修改，不依赖 git archive）
+Remove-Item code_update_round7.tar.gz -ErrorAction SilentlyContinue
+tar -czf code_update_round7.tar.gz `
+    tools/quant_ptq_minmax.py `
+    docs/SERVER_DEPLOY.md
+
+# 上传到服务器项目目录
+scp code_update_round7.tar.gz yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/
+```
+
+```bash
+# ===== 在服务器执行 =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+tar xzf code_update_round7.tar.gz
+mkdir -p logs
+```
+
+### Round 7 Step 1：实验清单（4 个并行）
+
+| GPU# | 实验名 | 量化配置 | 关键参数 |
+|------|--------|----------|----------|
+| 0 | R7-A | 7/8（skip vtransform）+ lidar(per-channel KL) | `--skip-modules camera/vtransform --act-observer kl_divergence --sparse-act-mode per_channel` |
+| 1 | R7-B | 8/8 + vt(KL) + lidar(per-channel KL) | `--vtransform-observer kl_divergence --act-observer kl_divergence --sparse-act-mode per_channel` |
+| 3 | R7-C | 7/8 + lidar(per-channel KL) + LWC | `--skip-modules camera/vtransform --act-observer kl_divergence --sparse-act-mode per_channel --lwc` |
+| 4 | R7-D | 8/8 + vt(KL) + lidar(per-channel KL) + LWC | `--vtransform-observer kl_divergence --act-observer kl_divergence --sparse-act-mode per_channel --lwc` |
+
+### Round 7 Step 2：启动实验（tmux，各 pane 一条）
+
+```bash
+# ===== tmux pane for GPU#0: R7-A =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round7_ptq6_lidar_pc_kl_calib128s \
+    --skip-modules camera/vtransform \
+    --calib-batches 128 --calib-shuffle \
+    --act-observer kl_divergence \
+    --sparse-act-mode per_channel \
+    2>&1 | tee logs/round7_ptq6_lidar_pc_kl_calib128s.log
+```
+
+```bash
+# ===== tmux pane for GPU#1: R7-B =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round7_ptq8_vtkl_lidarpc_kl_calib128s \
+    --calib-batches 128 --calib-shuffle \
+    --vtransform-observer kl_divergence \
+    --act-observer kl_divergence \
+    --sparse-act-mode per_channel \
+    2>&1 | tee logs/round7_ptq8_vtkl_lidarpc_kl_calib128s.log
+```
+
+```bash
+# ===== tmux pane for GPU#3: R7-C =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round7_ptq6_lidar_pc_kl_lwc_calib128s \
+    --skip-modules camera/vtransform \
+    --calib-batches 128 --calib-shuffle \
+    --act-observer kl_divergence \
+    --sparse-act-mode per_channel \
+    --lwc \
+    2>&1 | tee logs/round7_ptq6_lidar_pc_kl_lwc_calib128s.log
+```
+
+```bash
+# ===== tmux pane for GPU#4: R7-D =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round7_ptq8_vtkl_lidarpc_kl_lwc_calib128s \
+    --calib-batches 128 --calib-shuffle \
+    --vtransform-observer kl_divergence \
+    --act-observer kl_divergence \
+    --sparse-act-mode per_channel \
+    --lwc \
+    2>&1 | tee logs/round7_ptq8_vtkl_lidarpc_kl_lwc_calib128s.log
+```
+
+### Round 7 Step 3：服务器打包结果并传回本地
+
+```bash
+# ===== 在服务器执行 =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+tar czf round7_results.tar.gz \
+    logs/round7_ptq6_lidar_pc_kl_calib128s.log \
+    logs/round7_ptq8_vtkl_lidarpc_kl_calib128s.log \
+    logs/round7_ptq6_lidar_pc_kl_lwc_calib128s.log \
+    logs/round7_ptq8_vtkl_lidarpc_kl_lwc_calib128s.log \
+    runs/round7_ptq6_lidar_pc_kl_calib128s/ptq_minmax_model.pth \
+    runs/round7_ptq8_vtkl_lidarpc_kl_calib128s/ptq_minmax_model.pth \
+    runs/round7_ptq6_lidar_pc_kl_lwc_calib128s/ptq_minmax_model.pth \
+    runs/round7_ptq8_vtkl_lidarpc_kl_lwc_calib128s/ptq_minmax_model.pth
+ls -lh round7_results.tar.gz
+```
+
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/round7_results.tar.gz `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\
+
+cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
+tar xzf round7_results.tar.gz
+
+# 可选：仅拉日志（不拉模型）
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/logs/round7_*.log `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\logs\
+```
+
+### Round 7 结果解读指引
+
+| 对比 | 目标 |
+|------|------|
+| R7-A vs R6-A | 在 7/8 场景下，KL(per-channel) 相比 EMA(per-channel) 是否提升 |
+| R7-B vs R6-B | 在 8/8 + vt(KL) 下，KL(per-channel) 相比 EMA(per-channel) 是否提升 |
+| R7-C vs R7-A | 在 KL(per-channel) 前提下，LWC 是否继续带来收益 |
+| R7-D vs R7-B | 在 vt(KL)+KL(per-channel) 前提下，LWC 是否有额外增益 |
+
+
+## Round 8：Sparse-Aware KL 校准 + W8A16 控制实验（2026-03）
+
+> **目标**：验证 `KLDivergenceObserver` 的 `sparse_mode=True`（稀疏感知校准）修复能否
+> 显著缓解 lidar/backbone 量化的 −18% NDS 损失。同时通过 W8A16 控制实验定量区分
+> 激活量化 vs 权重量化各自的精度贡献。
+>
+> **修复内容（本轮新增）**：
+>
+> 1. `KLDivergenceObserver` 新增 `sparse_mode` 参数 —— 构建直方图时跳过 `|x| < 1e-6`
+>    的零值元素，消除 ReLU 零值在 bin[0] 的巨大尖峰对 KL 搜索的偏差
+> 2. `_QuantizedSparseConv.forward()` 改用 `_replace_feature()` 替代 in-place 写入，
+>    权重还原用 `try-finally` 保证异常安全
+> 3. 新增 `--no-lidar-act-quant` 参数（W8A16 模式）：lidar 只量化权重，激活保持 FP
+>
+> **校准设置**：训练集（`cfg.data.train` + `test_mode=True`），
+> `--calib-batches 128 --calib-shuffle`（与 Round 5/7 保持一致）。
+
+---
+
+### Round 8 Step 0：本地打包上传（PowerShell）
+
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+cd D:\Research\Replication\BEVFusion_with_MQBench
+
+Remove-Item code_update_round8.tar.gz -ErrorAction SilentlyContinue
+tar -czf code_update_round8.tar.gz `
+    tools/quant_ptq_minmax.py `
+    docs/SERVER_DEPLOY.md
+
+scp code_update_round8.tar.gz yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/
+```
+
+```bash
+# ===== 在服务器执行 =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+tar xzf code_update_round8.tar.gz
+mkdir -p logs
+```
+
+---
+
+### Round 8 Step 1：实验清单（4 个并行）
+
+| GPU# | 实验名   | 量化配置                                                     | 关键新参数                                                   | 对比基准                                 |
+| ---- | -------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ---------------------------------------- |
+| 0    | **R8-A** | 7/8（skip vtransform）+ lidar **sparse-aware KL** per-tensor | `--act-observer kl_divergence` (自动 sparse_mode=True)       | R7-A（lidar per-channel KL，−18%）       |
+| 1    | **R8-B** | 8/8 + vt(KL) + lidar **sparse-aware KL** per-tensor          | `--vtransform-observer kl_divergence --act-observer kl_divergence` | Round 5 8/8 KL(both，−18.7%）            |
+| 3    | **R8-C** | 7/8（skip vtransform）+ lidar **W8A16**（仅权重量化）        | `--no-lidar-act-quant`                                       | 控制实验：测激活量化的单独贡献           |
+| 4    | **R8-D** | 8/8 + vt(KL) + lidar **sparse-aware KL** per-channel         | `--vtransform-observer kl_divergence --act-observer kl_divergence --sparse-act-mode per_channel` | R7-B（per-channel KL，未含 sparse_mode） |
+
+> **核心假设**：Round 6/7 中 per-channel KL 对 lidar 无效，是因为直方图被零值尖峰污染，
+> KL 搜索返回了过大的截断阈值。`sparse_mode=True` 修复后，理论上效果应接近 vtransform KL
+> 的改善幅度（从 −18% 降至 <5%）。
+
+---
+
+### Round 8 Step 2：启动实验（tmux，各 pane 一条）
+
+**每个 tmux 窗口执行前的环境初始化（必须）：**
+
+```bash
+conda activate bevfusion_mqbench
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+export LD_LIBRARY_PATH=$(python -c "import torch,os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"):$LD_LIBRARY_PATH
+```
+
+---
+
+```bash
+# ===== tmux pane for GPU#0: R8-A =====
+# 7/8（skip vtransform）+ lidar sparse-aware KL per-tensor
+# 核心验证：sparse_mode 修复是否能让 per-tensor KL 打破 −18% 瓶颈
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round8_ptq7_lidar_sparse_kl_pt_calib128s \
+    --skip-modules camera/vtransform \
+    --calib-batches 128 --calib-shuffle \
+    --act-observer kl_divergence \
+    --sparse-act-mode per_tensor \
+    2>&1 | tee logs/round8_ptq7_lidar_sparse_kl_pt_calib128s.log
+```
+
+```bash
+# ===== tmux pane for GPU#1: R8-B =====
+# 8/8 + vt(KL) + lidar sparse-aware KL per-tensor
+# 核心验证：8/8 全量化在 sparse_mode 修复后是否能越过 −18% 的上限
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round8_ptq8_vtkl_lidar_sparse_kl_pt_calib128s \
+    --calib-batches 128 --calib-shuffle \
+    --vtransform-observer kl_divergence \
+    --act-observer kl_divergence \
+    --sparse-act-mode per_tensor \
+    2>&1 | tee logs/round8_ptq8_vtkl_lidar_sparse_kl_pt_calib128s.log
+```
+
+```bash
+# ===== tmux pane for GPU#3: R8-C =====
+# 7/8（skip vtransform）+ lidar W8A16（仅权重量化，激活保持 FP）
+# 控制实验：如果 NDS 损失接近 0，说明 −18% 100% 来自激活量化；
+#           如果仍有较大损失，说明权重量化也有贡献
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round8_ptq7_lidar_w8a16_calib128s \
+    --skip-modules camera/vtransform \
+    --calib-batches 128 --calib-shuffle \
+    --no-lidar-act-quant \
+    2>&1 | tee logs/round8_ptq7_lidar_w8a16_calib128s.log
+```
+
+```bash
+# ===== tmux pane for GPU#4: R8-D =====
+# 8/8 + vt(KL) + lidar sparse-aware KL per-channel
+# 在 sparse_mode 修复的基础上，验证 per-channel 是否进一步带来增益
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+conda activate bevfusion_mqbench
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 python tools/quant_ptq_minmax.py \
+    configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
+    --load-from pretrained/bevfusion-det.pth \
+    --run-dir runs/round8_ptq8_vtkl_lidar_sparse_kl_pc_calib128s \
+    --calib-batches 128 --calib-shuffle \
+    --vtransform-observer kl_divergence \
+    --act-observer kl_divergence \
+    --sparse-act-mode per_channel \
+    2>&1 | tee logs/round8_ptq8_vtkl_lidar_sparse_kl_pc_calib128s.log
+```
+
+---
+
+### Round 8 Step 3：监控进度
+
+```bash
+# 查看所有 tmux 窗口
+tmux ls
+
+# 查看特定实验输出（Ctrl+B D 断开，不杀进程）
+tmux attach -t gpu0   # R8-A
+tmux attach -t gpu1   # R8-B
+tmux attach -t gpu3   # R8-C
+tmux attach -t gpu4   # R8-D
+
+# 实验完成后快速汇总 NDS
+grep -h "object/nds" logs/round8_*.log | sed "s/.*'object\/nds': \([0-9.]*\).*/\1/"
+
+# 或直接 grep NDS 行
+grep -h "NDS\|nds" logs/round8_*.log | grep -v "^#"
+```
+
+---
+
+### Round 8 Step 4：服务器打包结果并传回本地
+
+```bash
+# ===== 在服务器执行 =====
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+tar czf round8_results.tar.gz \
+    logs/round8_ptq7_lidar_sparse_kl_pt_calib128s.log \
+    logs/round8_ptq8_vtkl_lidar_sparse_kl_pt_calib128s.log \
+    logs/round8_ptq7_lidar_w8a16_calib128s.log \
+    logs/round8_ptq8_vtkl_lidar_sparse_kl_pc_calib128s.log \
+    runs/round8_ptq7_lidar_sparse_kl_pt_calib128s/ptq_minmax_model.pth \
+    runs/round8_ptq8_vtkl_lidar_sparse_kl_pt_calib128s/ptq_minmax_model.pth \
+    runs/round8_ptq7_lidar_w8a16_calib128s/ptq_minmax_model.pth \
+    runs/round8_ptq8_vtkl_lidar_sparse_kl_pc_calib128s/ptq_minmax_model.pth
+ls -lh round8_results.tar.gz
+```
+
+```powershell
+# ===== 在本地 PowerShell 执行 =====
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/round8_results.tar.gz `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\
+
+cd D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts
+tar xzf round8_results.tar.gz
+
+# 可选：仅拉日志（不拉模型）
+scp yellowstone@10.129.51.101:/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/logs/round8_*.log `
+    D:\Research\Replication\BEVFusion_with_MQBench\server_artifacts\logs\
+```
+
+---
+
+### Round 8 结果解读指引
+
+| 对比                                                         | 结论判断标准                                                 |
+| ------------------------------------------------------------ | ------------------------------------------------------------ |
+| **R8-A vs R7-A**（sparse_mode KL/per-tensor vs per-channel KL/无sparse_mode） | NDS 大幅提升 → 零值污染是 Round 6/7 失败的根因；无提升 → 问题在别处 |
+| **R8-B vs Round5 8/8 KL(both)**（含 sparse_mode vs 不含）    | 直接验证 sparse_mode 对 8/8 全量化上限的影响                 |
+| **R8-C（W8A16）**                                            | NDS 损失 ≈ 0 → −18% 完全来自激活量化；损失 > 3% → 权重量化也有贡献 |
+| **R8-D vs R8-B**（per-channel sparse_mode KL vs per-tensor sparse_mode KL） | 在 sparse_mode 已修复的前提下，per-channel 是否进一步带来增益 |
+
+#### 结果预期表（供参考，实测以数据为准）
+
+| 实验                              | 乐观预期 NDS          | 悲观预期 NDS      | 关键判断                                    |
+| --------------------------------- | --------------------- | ----------------- | ------------------------------------------- |
+| R8-A（7/8 sparse KL per-tensor）  | 0.68~0.70（损失 <1%） | 0.60（损失 ~14%） | 是否突破 Round 7 的 −18% 上限               |
+| R8-B（8/8 sparse KL per-tensor）  | 0.67~0.70             | 0.57              | 全量化能否达到 7/8 水平                     |
+| R8-C（7/8 W8A16 控制）            | ≥0.70（近零损失）     | 0.68（损失 ~4%）  | 精确拆解激活 vs 权重贡献                    |
+| R8-D（8/8 sparse KL per-channel） | 0.68~0.70             | 0.60              | per-channel 是否在 sparse_mode 后有额外收益 |

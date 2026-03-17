@@ -162,12 +162,19 @@ def _stats_text(stats: dict) -> str:
 
 
 def plot_layer(layer: LayerStats, out_path: str):
-    """为单层生成 2×2 的子图：权重直方图、激活直方图（全范围 + 裁剪）、统计文本。"""
+    """为单层生成多子图：权重/激活的全范围与 p99.9 zoom 直方图。"""
     w = layer.weight_vals
     a = layer.act_vals
 
-    n_cols = 2 + (1 if a is not None else 0)
+    n_cols = 0
+    if w is not None:
+        n_cols += 2  # full + zoom
+    if a is not None:
+        n_cols += 2  # full + zoom
+    if n_cols == 0:
+        return
     fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 4))
+    axes = np.atleast_1d(axes)
     fig.suptitle(f"Layer: {layer.name}", fontsize=11, fontweight="bold")
 
     col = 0
@@ -181,6 +188,13 @@ def plot_layer(layer: LayerStats, out_path: str):
                        transform=axes[col].transAxes, fontsize=6,
                        va="top", ha="left",
                        bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+        col += 1
+
+        # ---- 权重直方图（裁剪到 p99.9 范围，看主体分布）----
+        w_p999 = ws["p99.9"]
+        _plot_hist_with_stats(axes[col], w, _COLORS["weight"],
+                              f"Weights (zoom ≤p99.9={w_p999:.3f})",
+                              xlim=(-w_p999 * 1.1, w_p999 * 1.1))
         col += 1
 
     # ---- 激活直方图（全范围） ----
