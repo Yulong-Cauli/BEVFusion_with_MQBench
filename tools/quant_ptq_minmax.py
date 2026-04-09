@@ -421,8 +421,21 @@ class SparseLog2FakeQuantize(nn.Module):
         self.fake_quant_enabled.fill_(0)
 
     def calculate_qparams(self):
-        """log2_base 在 forward 中 EMA 更新，此处无需额外计算。"""
-        pass
+        """Populate scale/zero_point buffers for MQBench compatibility.
+
+        log2_base is updated via EMA during forward; this method only
+        materializes the equivalent linear scale for downstream tools.
+        """
+        scale = torch.pow(2.0, self.log2_base.float())
+        if not hasattr(self, 'scale') or self.scale is None:
+            self.register_buffer('scale', scale.detach().clone())
+        else:
+            self.scale.detach().copy_(scale)
+        if not hasattr(self, 'zero_point') or self.zero_point is None:
+            self.register_buffer('zero_point', torch.zeros_like(scale, dtype=torch.long))
+        else:
+            self.zero_point.detach().fill_(0)
+        return self.scale, self.zero_point
 
     @property
     def scale(self):
@@ -815,6 +828,7 @@ class _QuantizedSparseConv(SparseModule):
             act_per_channel=act_per_channel,
             no_act_quant=no_act_quant,
         )
+        self.register_buffer('_weight_dirty', torch.tensor(0, dtype=torch.uint8))
 
     @property
     def weight(self):
@@ -827,18 +841,32 @@ class _QuantizedSparseConv(SparseModule):
     def forward(self, input):
         assert isinstance(input, SparseConvTensor)
 
+        if self.training:
+            raise RuntimeError(
+                "_QuantizedSparseConv does not support training mode. "
+                "Please use eval mode for PTQ inference."
+            )
+
+        if self._weight_dirty.item():
+            raise RuntimeError(
+                "_QuantizedSparseConv detected dirty weight state from a previous "
+                "interrupted forward. Please reload the model checkpoint."
+            )
+
         # ★ 激活量化（_replace_feature 避免 in-place 改写）
         if self.act_fake_quant is not None:
             quant_feats = self.act_fake_quant(input.features)
             input = _replace_feature(input, quant_feats)
 
-        # ★ 权重量化（try-finally 保证异常时也还原）
+        # ★ 权重量化：用 in-place copy_ 替代 data 指针重写，更稳定且不会替换 Parameter
         saved_weight = self.conv.weight.data.clone()
+        self.conv.weight.data.copy_(self.weight_fake_quant(saved_weight))
+        self._weight_dirty.fill_(1)
         try:
-            self.conv.weight.data = self.weight_fake_quant(saved_weight)
             output = self.conv(input)
         finally:
-            self.conv.weight.data = saved_weight
+            self.conv.weight.data.copy_(saved_weight)
+            self._weight_dirty.fill_(0)
         return output
 
 

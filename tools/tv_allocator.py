@@ -142,6 +142,32 @@ def cublas_gemm_fp32(A_ptr, B_ptr, C_ptr, M, N, K, stream_int=0):
     assert status == 0, f"cublasGemmEx failed with status {status}"
 
 
+def cublas_gemm_fp16_nn(A_ptr, B_ptr, C_ptr, M, N, K, stream_int=0):
+    """C[M,N] = A[M,K] @ B[K,N]  (all FP16, row-major, no transpose on B)
+
+    cuBLAS column-major: C_col[N,M] = B_col[N,K] @ A_col[K,M]
+    = gemm(OP_N, OP_N, N, M, K, alpha, B, N, A, K, beta, C, N)
+    """
+    if stream_int:
+        _cublas.cublasSetStream_v2(_cublas_handle, ctypes.c_void_p(stream_int))
+    alpha = ctypes.c_float(1.0)
+    beta = ctypes.c_float(0.0)
+    status = _cublas.cublasGemmEx(
+        _cublas_handle,
+        ctypes.c_int(CUBLAS_OP_N),
+        ctypes.c_int(CUBLAS_OP_N),
+        ctypes.c_int(N), ctypes.c_int(M), ctypes.c_int(K),
+        ctypes.byref(alpha),
+        B_ptr, ctypes.c_int(CUDA_R_16F), ctypes.c_int(N),
+        A_ptr, ctypes.c_int(CUDA_R_16F), ctypes.c_int(K),
+        ctypes.byref(beta),
+        C_ptr, ctypes.c_int(CUDA_R_16F), ctypes.c_int(N),
+        ctypes.c_int(CUBLAS_COMPUTE_32F),
+        ctypes.c_int(CUBLAS_GEMM_DEFAULT),
+    )
+    assert status == 0, f"cublasGemmEx failed with status {status}"
+
+
 def cublas_axpy_fp16(y_ptr, x_ptr, n, stream_int=0):
     """y += x (both FP16). Uses cublasAxpyEx with FP32 execution type."""
     if stream_int:
