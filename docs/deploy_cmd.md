@@ -1,5 +1,7 @@
 # BEVFusion TensorRT 部署命令手册
 
+> **Orin 新版命令请优先使用：`docs/orin_deploy_cmd.md`**（SM87 本机重建引擎，strict zero-torch）。
+>
 > 所有命令在项目根目录下运行：`cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench`
 > 环境：`conda activate bevfusion_mqbench`
 > GPU 映射：GPU 0,1,3,4 = RTX 3090 (SM 8.6)，GPU 2 = A100 (跳过)
@@ -402,7 +404,7 @@ python -u tools/trt_infer_standalone.py \
 cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
 conda activate /media/yellowstone/data2/CYL/spconv23_deploy
 
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=4 \
 python -u tools/trt_infer_standalone.py \
     --config configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser.yaml \
     --ckpt pretrained/bevfusion-det.pth \
@@ -443,3 +445,58 @@ python -u tools/trt_infer_standalone.py \
 - 4 卡并行时每卡独立加载模型 + 引擎，显存约 14GB/卡
 - 合并评估 `merge_eval.py` 不需要 GPU，只做 NDS 计算
 - `*_sm86.engine` 后缀表示在 RTX 3090 上构建的引擎
+
+---
+
+## Section 10: TRT 10.3 Orin 兼容性预验证（x86 本地）
+
+> Jetson Orin 预装 TensorRT 10.3。RTX 3090 上构建的 TRT 10.15 + SM 8.6 引擎**无法**直接在 Orin 上运行。需在 x86 上提前用 TRT 10.3 验证 ONNX 可构建性。
+>
+> 为了不碰服务器公共资源，TRT 10.3 以 `pip --target` 方式安装到项目本地目录：`trt_10.3_env/`。
+
+### 本地 TRT 10.3 环境使用方式
+
+```bash
+cd /media/yellowstone/data2/CYL/BEVFusion_with_MQBench
+
+# 设置 Python/库路径（仅当前 shell 生效）
+export TRT103=/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/trt_10.3_env
+export PYTHONPATH=$TRT103:$PYTHONPATH
+export LD_LIBRARY_PATH=$TRT103/tensorrt_libs:$LD_LIBRARY_PATH
+
+# 验证版本
+conda run -n bevfusion_mqbench python -c "import tensorrt as trt; print(trt.__version__)"
+# 期望输出：10.3.0
+```
+
+### 用 TRT 10.3 构建引擎
+
+```bash
+export TRT103=/media/yellowstone/data2/CYL/BEVFusion_with_MQBench/trt_10.3_env
+export PYTHONPATH=$TRT103:$PYTHONPATH
+export LD_LIBRARY_PATH=$TRT103/tensorrt_libs:$LD_LIBRARY_PATH
+
+conda run -n bevfusion_mqbench python tools/build_trt_engine.py \
+    --onnx artifacts/camera_neck_int8.onnx \
+    --engine artifacts/camera_neck_int8_trt103.engine \
+    --int8 --fp16 --workspace 4096 \
+    --timing-cache artifacts/trt103_timing.cache
+```
+
+### 预验证结果（2026-04-13）
+
+| ONNX | TRT 10.3 Build | 说明 |
+|------|----------------|------|
+| `swin_int8.onnx` | 32.36 MB | 成功构建并反序列化 |
+| `camera_neck_int8.onnx` | 2.18 MB | 成功构建并反序列化 |
+| `vtransform_depthnet_int8.onnx` | 2.14 MB | 成功构建并反序列化 |
+| `fuser_decoder_int8.onnx` | 6.93 MB | 成功构建并反序列化 |
+| `transfusion_head_int8.onnx` | 3.84 MB | 成功构建并反序列化（8 个输出） |
+| `lidar_backbone_*.onnx` | 失败 | ONNX 含循环/重复输出名；TRT 10.15 下也失败（missing SparseConvolution plugin）。需重新导出或加载 spconv plugin，**非 TRT 10.3 兼容性问题** |
+
+### 关键观察
+
+1. **UINT8 zero_point 警告**：所有 INT8 ONNX 都会报 `QuantizeLinear/DequantizeLinear with UINT8 zero_point` 警告。TRT 10.3 自动 fallback 到 INT8，**不影响构建**。
+2. **SM 绑定**：上述 engine 是在 SM 8.6 (RTX 3090) 上构建的，**仍不能直接在 Orin SM 8.7 上运行**。此步骤只为验证“ONNX → engine”在 TRT 10.3 的 parser 层无兼容性问题。真正上 Orin 需在 Orin 本机或 cross-build 重新构建。
+3. **Hardware Compatibility**：TRT 10.3 Python 包中 `HARDWARE_COMPATIBLE_AMAX` 不可用；跨 SM 8.6→8.7 的引擎迁移仍需在 Orin 上重新 build。
+```
