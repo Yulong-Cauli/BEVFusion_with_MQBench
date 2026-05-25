@@ -36,6 +36,7 @@ BEVFusion PTQ (Post-Training Quantization) with MQBench — MinMax Calibration
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -362,13 +363,13 @@ class KLDivergenceObserver(ObserverBase):
 class SparseLog2FakeQuantize(nn.Module):
     """对数域激活量化，适用于 BN+ReLU 后的稀疏卷积特征。
 
-    可表示的非零正值集合：{2^(log2_base + k) : k ∈ [qmin, qmax]}
-    其中 log2_base 通过校准数据非零激活分布的低百分位自动估计。
+    可表示的非零正值集合：{a^(log_a_base + k) : k ∈ [qmin, qmax]}
+    其中 log_a_base 通过校准数据非零激活分布的低百分位自动估计。
     零值始终精确还原。
 
     与 INT8 均匀量化的关键区别：
       - 均匀：绝对误差恒定，小幅值信号相对误差 >> 100%
-      - Log2：相对误差恒定 ≈ 41%，对对数正态稀疏分布最优
+      - LogA：相对误差近似恒定，对对数正态稀疏分布更友好
 
     与 MQBench enable_calibration / enable_quantization 完全兼容：
       - enable_calibration:  observer ON,  fake_quant OFF → 更新 log2_base
@@ -381,17 +382,21 @@ class SparseLog2FakeQuantize(nn.Module):
         ema_ratio:     log2_base EMA 更新系数（默认 0.9）
         percentile:    估计 base 用的分位数（默认 0.05 = 第 5 百分位）
         eps:           零值判断阈值（默认 1e-6）
+        log_base:      对数底 a（默认 2.0 = 原始 Log2；可设为 1.25/1.5/e/...）
     """
 
     def __init__(self, n_bits=8, per_channel=False, ch_axis=1,
-                 ema_ratio=0.9, percentile=0.05, eps=1e-6):
+                 ema_ratio=0.9, percentile=0.05, eps=1e-6, log_base=2.0):
         super().__init__()
+        if log_base <= 1.0:
+            raise ValueError(f"log_base must be > 1.0, got {log_base}")
         self.n_bits = n_bits
         self.per_channel = per_channel
         self.ch_axis = ch_axis
         self.ema_ratio = ema_ratio
         self.percentile = percentile
         self.eps = eps
+        self.register_buffer("log_base", torch.tensor(float(log_base), dtype=torch.float32))
         # 对称 INT8：[-127, 127]，正侧 127 个格点
         self.qmin = -(2 ** (n_bits - 1) - 1)
         self.qmax = (2 ** (n_bits - 1) - 1)
@@ -426,7 +431,7 @@ class SparseLog2FakeQuantize(nn.Module):
         log2_base is updated via EMA during forward; this method only
         materializes the equivalent linear scale for downstream tools.
         """
-        scale = torch.pow(2.0, self.log2_base.float())
+        scale = torch.pow(self.log_base.float(), self.log2_base.float())
         if not hasattr(self, 'scale') or self.scale is None:
             self.register_buffer('scale', scale.detach().clone())
         else:
@@ -439,8 +444,8 @@ class SparseLog2FakeQuantize(nn.Module):
 
     @property
     def scale(self):
-        """等效线性 scale = 2^log2_base（供诊断 / 日志使用）。"""
-        return torch.pow(2.0, self.log2_base.float())
+        """等效线性 scale = a^log_a_base（供诊断 / 日志使用）。"""
+        return torch.pow(self.log_base.float(), self.log2_base.float())
 
     @property
     def zero_point(self):
@@ -449,7 +454,11 @@ class SparseLog2FakeQuantize(nn.Module):
     # ── 校准：估计 log2_base ─────────────────────────────────────────────
     def _update_base_per_tensor(self, x_nz_abs: torch.Tensor):
         """用非零绝对值的第 p 百分位更新 log2_base（EMA）。"""
-        log2_vals = torch.log2(x_nz_abs.clamp(min=1e-30))
+        x_safe = x_nz_abs.clamp(min=1e-30)
+        if abs(self.log_base.item() - 2.0) < 1e-6:
+            log2_vals = torch.log2(x_safe)
+        else:
+            log2_vals = torch.log(x_safe) / math.log(float(self.log_base.item()))
         k = max(1, int(self.percentile * x_nz_abs.numel()))
         # sort().values[k]：第 k 小的 log2 值 = 第 p 百分位
         new_log2_base = log2_vals.sort().values[k].clamp(-20.0, 2.0)
@@ -476,7 +485,10 @@ class SparseLog2FakeQuantize(nn.Module):
             nz_c = x_c[x_c > self.eps]
             if nz_c.numel() < 5:
                 continue
-            log2_c = torch.log2(nz_c)
+            if abs(self.log_base.item() - 2.0) < 1e-6:
+                log2_c = torch.log2(nz_c)
+            else:
+                log2_c = torch.log(nz_c) / math.log(float(self.log_base.item()))
             k = max(1, int(self.percentile * nz_c.numel()))
             new_base_c = log2_c.sort().values[k].clamp(-20.0, 2.0)
             if not self._initialized.item():
@@ -519,9 +531,13 @@ class SparseLog2FakeQuantize(nn.Module):
         else:
             base = self.log2_base.to(x_f.device)
 
-        log2_x = torch.log2(x_f.abs().clamp(min=1e-30)) - base
+        x_abs = x_f.abs().clamp(min=1e-30)
+        if abs(self.log_base.item() - 2.0) < 1e-6:
+            log2_x = torch.log2(x_abs) - base
+        else:
+            log2_x = torch.log(x_abs) / math.log(float(self.log_base.item())) - base
         q_int = torch.round(log2_x).clamp(self.qmin, self.qmax)
-        x_dq = sign * torch.pow(2.0, q_int + base)
+        x_dq = sign * torch.pow(self.log_base.to(x_f.device), q_int + base)
         x_dq = torch.where(zero_mask, torch.zeros_like(x_f), x_dq)
 
         # STE：梯度直通，前向使用量化值
@@ -535,7 +551,7 @@ class SparseLog2FakeQuantize(nn.Module):
         else:
             base_str = f"log2_base={self.log2_base.item():.2f}"
         return (f"n_bits={self.n_bits}, per_channel={self.per_channel}, "
-                f"qmin={self.qmin}, qmax={self.qmax}, {base_str}, "
+                f"qmin={self.qmin}, qmax={self.qmax}, log_base={self.log_base.item():.4g}, {base_str}, "
                 f"percentile={self.percentile}")
 
 
@@ -549,16 +565,19 @@ def _report_log2_quantizer_results(model, logger):
             if module._initialized.item():
                 count += 1
                 if b.numel() == 1:
+                    log_base = float(module.log_base.item())
                     logger.info(
                         f"  Log2 [{name.split('.')[-2]}]: "
                         f"log2_base={b.item():.3f}  "
-                        f"base={2 ** b.item():.4f}  "
-                        f"range=[{2 ** (b.item() + module.qmin):.4e}, "
-                        f"{2 ** (b.item() + module.qmax):.4f}]"
+                        f"log_base={log_base:.4g}  "
+                        f"base={log_base ** b.item():.4f}  "
+                        f"range=[{log_base ** (b.item() + module.qmin):.4e}, "
+                        f"{log_base ** (b.item() + module.qmax):.4f}]"
                     )
                 else:
                     logger.info(
                         f"  Log2 [{name.split('.')[-2]}] per-channel C={b.numel()}: "
+                        f"log_base={module.log_base.item():.4g}, "
                         f"log2_base(mean/min/max)=("
                         f"{b.mean().item():.2f}/"
                         f"{b.min().item():.2f}/"
@@ -752,7 +771,7 @@ def _replace_feature(sparse_tensor: SparseConvTensor,
 
 
 def _create_spconv_fakeq_pair(act_observer_cls=None, act_per_channel=False,
-                              no_act_quant=False):
+                              no_act_quant=False, log_base=2.0):
     """创建 FakeQuant 对，适用于稀疏卷积。
 
     Round 8 新增：
@@ -788,6 +807,7 @@ def _create_spconv_fakeq_pair(act_observer_cls=None, act_per_channel=False,
         act_fq = SparseLog2FakeQuantize(
             per_channel=act_per_channel,
             ch_axis=1,
+            log_base=log_base,
         )
         return weight_fq, act_fq
 
@@ -820,13 +840,14 @@ class _QuantizedSparseConv(SparseModule):
     """
 
     def __init__(self, original, act_observer_cls=None, act_per_channel=False,
-                 no_act_quant=False):
+                 no_act_quant=False, log_base=2.0):
         super().__init__()
         self.conv = original
         self.weight_fake_quant, self.act_fake_quant = _create_spconv_fakeq_pair(
             act_observer_cls=act_observer_cls,
             act_per_channel=act_per_channel,
             no_act_quant=no_act_quant,
+            log_base=log_base,
         )
         self.register_buffer('_weight_dirty', torch.tensor(0, dtype=torch.uint8))
 
@@ -872,7 +893,7 @@ class _QuantizedSparseConv(SparseModule):
 
 def manual_quantize_sparse(
         module, logger, module_name="unknown", act_observer_cls=None,
-        act_per_channel=False, no_act_quant=False,
+        act_per_channel=False, no_act_quant=False, log_base=2.0,
 ):
     """对 SparseEncoder 中的稀疏卷积层插入 FakeQuantize 节点。
 
@@ -894,6 +915,7 @@ def manual_quantize_sparse(
                     act_observer_cls=act_observer_cls,
                     act_per_channel=act_per_channel,
                     no_act_quant=no_act_quant,
+                    log_base=log_base,
                 )
             ))
 
@@ -909,7 +931,7 @@ def manual_quantize_sparse(
     if no_act_quant:
         mode_str = "W8A16（权重only，激活FP）"
     elif is_log2:
-        mode_str = f"Log2量化, {act_scheme}"
+        mode_str = f"LogA量化(a={log_base:g}), {act_scheme}"
     elif is_kl:
         mode_str = f"{obs_name} [sparse_aware=ON], {act_scheme}"
     else:
@@ -995,6 +1017,7 @@ def apply_selective_ptq(
         vtransform_observer_cls=None,
         sparse_act_per_channel=False,
         no_lidar_act_quant=False,
+        log_base=2.0,
 ):
     """
     对模型中全部可量化子模块插入 FakeQuantize 节点。
@@ -1044,6 +1067,7 @@ def apply_selective_ptq(
                     act_observer_cls=act_observer_cls,
                     act_per_channel=sparse_act_per_channel,
                     no_act_quant=(no_lidar_act_quant and is_lidar),
+                    log_base=log_base,
                 )
                 success.append(f"{display_name} (稀疏)")
                 return
@@ -1405,6 +1429,7 @@ def build_ptq_model(
         vtransform_observer_cls=None,
         sparse_act_per_channel=False,
         no_lidar_act_quant=False,
+        log_base=2.0,
 ):
     """
     构建浮点模型，加载预训练权重，再对可量化子模块进行 PTQ 准备。
@@ -1441,6 +1466,7 @@ def build_ptq_model(
         vtransform_observer_cls=vtransform_observer_cls,
         sparse_act_per_channel=sparse_act_per_channel,
         no_lidar_act_quant=no_lidar_act_quant,
+        log_base=log_base,
     )
 
     return model, success, failed
@@ -1786,6 +1812,13 @@ def main():
              "recommended for log-normal sparse activations near 0)",
     )
     parser.add_argument(
+        "--log-base",
+        type=float,
+        default=2.0,
+        help="log base 'a' for sparse log-domain activation quantization when "
+             "--act-observer=log2. Default 2.0 (original Log2).",
+    )
+    parser.add_argument(
         "--sparse-act-mode",
         type=str,
         default="per_tensor",
@@ -1817,6 +1850,8 @@ def main():
              "quantization contribution to NDS degradation.",
     )
     args, opts = parser.parse_known_args()
+    if args.log_base <= 1.0:
+        raise ValueError(f"--log-base must be > 1.0, got {args.log_base}")
 
     configs.load(args.config, recursive=True)
     configs.update(opts)
@@ -1915,6 +1950,8 @@ def main():
         "kl_divergence": "KLDivergenceObserver (KL 散度最优截断)",
         "log2": "SparseLog2FakeQuantize (对数域量化，Round 9)",
     }[args.act_observer]
+    if args.act_observer == "log2":
+        act_obs_name += f", base={args.log_base:g}"
     # vtransform observer
     vt_obs_cls = None
     vt_obs_name = "EMAMinMaxObserver (默认)"
@@ -1945,6 +1982,7 @@ def main():
         vtransform_observer_cls=vt_obs_cls,
         sparse_act_per_channel=sparse_act_per_channel,
         no_lidar_act_quant=getattr(args, 'no_lidar_act_quant', False),
+        log_base=args.log_base,
     )
     model = MMDataParallel(model.cuda(), device_ids=[0])
     logger.info("模型已移动到 GPU（MMDataParallel）。")
@@ -1980,6 +2018,8 @@ def main():
     logger.info(f"║  主动跳过: {', '.join(args.skip_modules) if args.skip_modules else '(无)'}")
     logger.info(f"║  覆盖率  : {coverage_pct:.0f}%  ({len(quant_success)}/{total_possible} 个可量化模块)")
     logger.info(f"║  稀疏激活: {act_obs_name}{' [sparse_aware=ON]' if is_kl_sparse else ''}")
+    if is_log2:
+        logger.info(f"║  Log底数 : a={args.log_base:g} (a=2 等价原始 Log2)")
     logger.info(f"║  稀疏粒度: {sparse_act_scheme_name}")
     logger.info(f"║  VT激活  : {vt_obs_name}")
     logger.info(f"║  W8A16   : {'ON (lidar激活保持FP，仅权重量化)' if w8a16_flag else 'OFF (正常W8A8)'}")
@@ -2034,6 +2074,7 @@ def main():
         "ptq_method": "MinMax" + ("+LWC" if args.lwc else ""),
         "backend": "TensorRT",
         "sparse_act_observer": args.act_observer,
+        "sparse_log_base": args.log_base if args.act_observer == "log2" else None,
         "sparse_act_mode": args.sparse_act_mode,
         "vtransform_act_observer": args.vtransform_observer or "ema_minmax",
         "quantized_modules": [k for k, _ in _QUANTIZABLE_SUBMODULE_KEYS]

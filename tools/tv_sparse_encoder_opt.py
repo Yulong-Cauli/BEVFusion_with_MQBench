@@ -235,10 +235,12 @@ def sparse_conv_forward(
 
         mask_split_cnt = mask_tensor_from_cpp.dim(0)
 
-        # Keep mask tensor on GPU to avoid CPU roundtrip.
-        # In spconv Python path this mask is materialized through numpy first;
-        # here we use the C++ returned tensor directly for implicit_gemm.
-        mask_tv = mask_tensor_from_cpp.clone()
+        # Use mask from C++ return value (matches ops.py line 389/1503-1504)
+        # ops.py: masks = [mask_tensor[i:i+1].numpy() for i in range(mask_split_count)]
+        # ops.py: mask = np.concatenate(masks); mask_tv = tv.from_numpy(mask).clone()
+        masks_np = [mask_tensor_from_cpp[i:i+1].numpy() for i in range(mask_split_cnt)]
+        mask_np = np.concatenate(masks_np)
+        mask_tv = tv.from_numpy(mask_np).clone()
 
         # Read back C++-allocated tensors from alloc.allocated
         # Dynamic allocator allocates exact sizes — NO tight-pack slicing needed
@@ -372,67 +374,6 @@ class TVSparseEncoder:
 
         # BN layers follow each conv (same naming but with .1 suffix for conv_input/encoder_layerX.2)
         # Residual connections in BasicBlocks
-        self._debug_dict = None
-
-    def _record_sparse(self, name: str, x: TVSparseConvTensor):
-        if self._debug_dict is None:
-            return
-        _cudart.cudaDeviceSynchronize()
-        self._debug_dict[name] = {
-            "indices": x.indices.cpu().numpy().astype(np.int32, copy=False).copy(),
-            "features": x.features.cpu().numpy().astype(np.float32, copy=False).copy(),
-            "spatial_shape": list(x.spatial_shape),
-            "batch_size": int(x.batch_size),
-        }
-
-    def _resolve_torch_tensor(self, tv_ten: tv.Tensor, *, allocators=None, indice_dict=None):
-        """Resolve tv.Tensor to its backing torch.Tensor without device copies."""
-        ptr = int(tv_ten.byte_pointer())
-        allocators = allocators or []
-        for alloc in allocators:
-            refs = getattr(alloc, "_torch_refs", None)
-            if refs and ptr in refs:
-                return refs[ptr]
-        if indice_dict:
-            for cached in indice_dict.values():
-                if not isinstance(cached, dict):
-                    continue
-                alloc = cached.get("_alloc")
-                if alloc is None:
-                    continue
-                refs = getattr(alloc, "_torch_refs", None)
-                if refs and ptr in refs:
-                    return refs[ptr]
-        return None
-
-    def _sparse_to_dense_torch(self, x: TVSparseConvTensor, batch_size: int):
-        """Scatter sparse (indices, features) to dense tensor on GPU via torch."""
-        import torch
-
-        indices_th = self._resolve_torch_tensor(
-            x.indices, allocators=x._allocators, indice_dict=x.indice_dict
-        )
-        features_th = self._resolve_torch_tensor(
-            x.features, allocators=x._allocators, indice_dict=x.indice_dict
-        )
-        if indices_th is None or features_th is None:
-            # Conservative fallback for unexpected allocator ownership.
-            _cudart.cudaDeviceSynchronize()
-            indices_th = torch.from_numpy(x.indices.cpu().numpy()).cuda().int()
-            features_th = torch.from_numpy(x.features.cpu().numpy()).cuda()
-        else:
-            indices_th = indices_th.int()
-
-        dense = torch.zeros(
-            (batch_size, *x.spatial_shape, features_th.shape[1]),
-            dtype=features_th.dtype,
-            device=features_th.device,
-        )
-        dense[indices_th[:, 0], indices_th[:, 1], indices_th[:, 2], indices_th[:, 3]] = features_th
-        dense = dense.permute(0, 4, 3, 1, 2).contiguous()
-        n, c, d, h, w = dense.shape
-        dense = dense.view(n, c * d, h, w)
-        return dense
 
     def load_weights(self, ckpt_path, dtype=tv.float16):
         """Load weights from BEVFusion checkpoint into tv.Tensor.
@@ -512,17 +453,14 @@ class TVSparseEncoder:
         print(f"  Loaded {len(self.layer_params)} fused conv layers")
 
     def load_ptq_weights(self, ptq_ckpt_path, dtype=tv.float16):
-        """Load PTQ weights with fake quantization (supports INT8 Log2 and W8A16).
+        """Load PTQ INT8 weights with Log2 activation quantization.
 
         Weight fake quantization (symmetric INT8) is applied at load time:
           w_dq = round(w / scale).clamp(-127, 127) * scale
 
-        BN is kept UNFUSED (separate GPU kernel) to exactly match the PyTorch
-        FakeQuant computation graph.
-
-        Activation quantization behavior depends on checkpoint contents:
-        - If `act_fake_quant.log2_base` exists → apply Log2 fake quantization.
-        - Otherwise (e.g., W8A16) → skip activation quantization automatically.
+        For INT8 path, BN is kept UNFUSED (separate GPU kernel) to exactly
+        match the PyTorch FakeQuant computation graph.
+        Per-layer log2_base is stored for runtime Log2 fake quantization.
         """
         import torch
         ckpt = torch.load(ptq_ckpt_path, map_location="cpu")
@@ -599,71 +537,6 @@ class TVSparseEncoder:
 
         print(f"  Loaded {len(self.layer_params)} PTQ conv layers (BN separate)")
 
-    def load_npy_weights(self, npy_dir: str, dtype=tv.float16):
-        """Load weights from .npy files (zero-PyTorch deployment).
-
-        Args:
-            npy_dir: Directory containing .npy files (from extract_lidar_npy.py)
-            dtype: tv.float16 or tv.float32 for GPU storage
-        """
-        import os
-        metadata = np.load(os.path.join(npy_dir, "metadata.npy"), allow_pickle=True).item()
-
-        self._torch_weight_refs = []
-        loaded = 0
-
-        for layer_info in metadata["layers"]:
-            conv_name = layer_info["name"]
-            weight_file = layer_info["weight_file"]
-            has_bn = layer_info["has_bn"]
-            has_log2 = layer_info["has_log2"]
-            log2_base_val = layer_info["log2_base"]
-
-            # Load weight
-            w_path = os.path.join(npy_dir, weight_file)
-            w = np.load(w_path)
-
-            # If INT8 storage, load scale and dequantize
-            if w.dtype == np.int8:
-                scale_file = weight_file.replace("_weight_int8.npy", "_scale.npy")
-                scale = np.load(os.path.join(npy_dir, scale_file))
-                s = scale.astype(np.float32).reshape(-1, 1, 1, 1, 1)
-                w = w.astype(np.float32) * s
-
-            # Convert to target dtype for GPU
-            if dtype == tv.float16:
-                w = w.astype(np.float16)
-            elif dtype == tv.float32:
-                w = w.astype(np.float32)
-
-            w_tv, w_th = _np_to_tv_cuda(w, dtype)
-            self._torch_weight_refs.append(w_th)
-
-            # Load BN params
-            bn_scale_tv = tv.Tensor()
-            bn_shift_tv = tv.Tensor()
-            if has_bn:
-                bn_scale_file = weight_file.replace("_weight", "_bn_scale").replace("_fp16.npy", ".npy").replace("_fp32.npy", ".npy").replace("_int8.npy", ".npy")
-                bn_shift_file = weight_file.replace("_weight", "_bn_shift").replace("_fp16.npy", ".npy").replace("_fp32.npy", ".npy").replace("_int8.npy", ".npy")
-
-                scale_np = np.load(os.path.join(npy_dir, bn_scale_file)).astype(np.float32)
-                shift_np = np.load(os.path.join(npy_dir, bn_shift_file)).astype(np.float32)
-
-                bn_scale_tv, s_th = _np_to_tv_cuda(scale_np, tv.float32)
-                bn_shift_tv, sh_th = _np_to_tv_cuda(shift_np, tv.float32)
-                self._torch_weight_refs.extend([s_th, sh_th])
-
-            self.layer_params[conv_name] = {
-                "weight": w_tv,
-                "bias": None,
-                "bn_scale": bn_scale_tv if has_bn else None,
-                "bn_shift": bn_shift_tv if has_bn else None,
-                "log2_base": log2_base_val if has_log2 else None,
-            }
-            loaded += 1
-
-        print(f"  Loaded {loaded} layers from .npy (zero-PyTorch)")
-
     def _conv_bn_relu(self, x: TVSparseConvTensor, conv_name: str,
                       ksize, stride, padding, subm, indice_key) -> TVSparseConvTensor:
         """Conv + BN + ReLU.
@@ -685,7 +558,6 @@ class TVSparseEncoder:
             InferenceOps.bias_add_act_inplace(
                 x.features, params["bias"], tv.gemm.Activation.ReLU,
                 0.0, 0.0, self.stream)
-        self._record_sparse(f"{conv_name}.out", x)
         return x
 
     def _conv_bn(self, x: TVSparseConvTensor, conv_name: str,
@@ -701,22 +573,16 @@ class TVSparseEncoder:
             bn_forward_inplace(x.features, params["bn_scale"], params["bn_shift"], self.stream)
         elif params["bias"] is not None:
             InferenceOps.bias_add_inplace(x.features, params["bias"], self.stream)
-        self._record_sparse(f"{conv_name}.out", x)
         return x
 
     def _basic_block(self, x: TVSparseConvTensor, block_prefix: str) -> TVSparseConvTensor:
         """SparseBasicBlock: conv1+bn1+relu → conv2+bn2 → +identity → relu."""
         identity = x.features.clone()  # deep copy; _conv_bn_relu modifies x.features in-place via log2 quant
-        stage_name = block_prefix.split(".", 1)[0]
-        if not stage_name.startswith("encoder_layer"):
-            raise ValueError(f"Unexpected block prefix: {block_prefix}")
-        stage_idx = int(stage_name.replace("encoder_layer", ""))
-        subm_key = f"subm{stage_idx}"
 
         out = self._conv_bn_relu(x, f"{block_prefix}.conv1",
-                                 [3,3,3], [1,1,1], [1,1,1], True, subm_key)
+                                 [3,3,3], [1,1,1], [1,1,1], True, None)
         out = self._conv_bn(out, f"{block_prefix}.conv2",
-                            [3,3,3], [1,1,1], [1,1,1], True, subm_key)
+                            [3,3,3], [1,1,1], [1,1,1], True, None)
 
         # Residual add on GPU via cuBLAS axpy (no CPU roundtrip, no torch)
         n = out.features.dim(0) * out.features.dim(1)
@@ -728,16 +594,13 @@ class TVSparseEncoder:
             cublas_axpy_fp32(out_ptr, id_ptr, n, self.stream)
 
         relu_inplace(out.features, self.stream)
-        self._record_sparse(f"{block_prefix}.res_out", out)
         return out
 
     def forward(self, voxel_features: tv.Tensor, coors: tv.Tensor,
                 batch_size: int,
                 feature_ref=None,
-                coors_ref=None,
-                debug_dict: Optional[Dict[str, dict]] = None,
-                return_torch: bool = False):
-        """Full SparseEncoder forward.
+                coors_ref=None) -> np.ndarray:
+        """Full SparseEncoder forward. Returns dense BEV as numpy [N,C*D,H,W].
 
         Args:
             voxel_features: [num_voxels, 5] fp16 GPU (must be PyTorch-backed)
@@ -747,8 +610,7 @@ class TVSparseEncoder:
             coors_ref: optional torch.Tensor to keep coors alive
 
         Returns:
-            - numpy array [batch, 256, 180, 180] fp16 (default)
-            - torch.Tensor on CUDA when return_torch=True
+            numpy array [batch, 256, 180, 180] fp16
         """
         global _torch_refs
         _torch_refs = []  # clear refs from previous forward
@@ -756,10 +618,8 @@ class TVSparseEncoder:
             _torch_refs.append(feature_ref)
         if coors_ref is not None:
             _torch_refs.append(coors_ref)
-        self._debug_dict = debug_dict
 
         x = TVSparseConvTensor(voxel_features, coors, self.sparse_shape, batch_size)
-        self._record_sparse("input", x)
 
         # conv_input: SubMConv3d(5→16) + BN + ReLU
         x = self._conv_bn_relu(x, "conv_input.0", [3,3,3], [1,1,1], [1,1,1], True, "subm1")
@@ -786,11 +646,20 @@ class TVSparseEncoder:
         # conv_out: SparseConv3d(128→128, k=(1,1,3), s=(1,1,2)) + BN + ReLU
         x = self._conv_bn_relu(x, "conv_out.0", [1,1,3], [1,1,2], [0,0,0], False, "spconv_down2")
 
-        dense_t = self._sparse_to_dense_torch(x, batch_size)
-        if self._debug_dict is not None:
-            self._debug_dict["dense_out"] = dense_t.detach().float().cpu().numpy()
-        self._debug_dict = None
-        if return_torch:
-            return dense_t
-        dense = dense_t.detach().cpu().numpy()
+        # Sparse → Dense
+        # _cudart.cudaDeviceSynchronize()  # Removed: cpu().numpy() already syncs implicitly
+        indices_np = x.indices.cpu().numpy()  # [N, 4]
+        features_np = x.features.cpu().numpy()  # [N, 128]
+
+        # dense shape: [batch, *spatial_shape, C]
+        # spatial_shape after all downsamples = [180, 180, 2] (H, W, D)
+        dense_shape = [batch_size] + x.spatial_shape + [features_np.shape[1]]
+        dense = scatter_nd_numpy(indices_np, features_np, dense_shape)
+        # dense: [batch, H, W, D, C]
+        # spconv dense() returns [N, C, *spatial_shape] = [N, C, H, W, D]
+        # We need [N, C, D, H, W] → [N, C*D, H, W]
+        # So: [batch, H, W, D, C] → [batch, C, D, H, W]
+        dense = np.transpose(dense, (0, 4, 3, 1, 2))
+        N, C, D, H, W = dense.shape
+        dense = dense.reshape(N, C * D, H, W)
         return dense

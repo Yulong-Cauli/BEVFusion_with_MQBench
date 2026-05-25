@@ -1,0 +1,50 @@
+"""
+Build libbevfusion_voxel_layer.so without torch dependency.
+Usage:
+    python build_voxel_layer.py
+"""
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SO_PATH = os.path.join(HERE, "libbevfusion_voxel_layer.so")
+
+
+def get_cuda_home():
+    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+    if not os.path.isdir(cuda_home):
+        raise RuntimeError(f"CUDA_HOME not found: {cuda_home}")
+    return cuda_home
+
+
+def build():
+    cuda_home = get_cuda_home()
+    nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    if not os.path.exists(nvcc):
+        raise RuntimeError(f"nvcc not found: {nvcc}")
+
+    arch_flags = ["-gencode", "arch=compute_80,code=sm_80",
+                  "-gencode", "arch=compute_86,code=sm_86",
+                  "-gencode", "arch=compute_87,code=sm_87"]
+
+    cmd = [
+        nvcc,
+        "-shared",
+        "-O3",
+        "-Xcompiler", "-fPIC",
+        "-std=c++14",
+        *arch_flags,
+        os.path.join(HERE, "voxelization_cuda.cu"),
+        os.path.join(HERE, "voxelization_wrapper.cpp"),
+        "-lcudart",
+        "-o", SO_PATH,
+    ]
+
+    print("Building:", " ".join(cmd))
+    subprocess.check_call(cmd)
+    print(f"Built: {SO_PATH}")
+
+
+if __name__ == "__main__":
+    build()

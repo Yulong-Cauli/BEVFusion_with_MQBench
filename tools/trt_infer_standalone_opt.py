@@ -17,7 +17,6 @@ Usage:
         --test-single
 """
 import argparse
-import hashlib
 import logging
 import os
 import sys
@@ -60,36 +59,6 @@ from mmdet3d.datasets import build_dataloader, build_dataset
 from mmdet3d.utils import recursive_eval
 
 import spconv.pytorch as spconv
-
-
-def _summarize_tensor(arr):
-    if torch.is_tensor(arr):
-        arr = arr.detach().cpu().numpy()
-    arr = np.asarray(arr)
-    size = int(arr.size)
-    if size == 0:
-        return {
-            "shape": list(arr.shape),
-            "dtype": str(arr.dtype),
-            "size": 0,
-            "nonzero": 0,
-            "nz_ratio": 0.0,
-            "l2": 0.0,
-            "abs_max": 0.0,
-            "mean": 0.0,
-        }
-    arr64 = arr.astype(np.float64, copy=False)
-    nonzero = int(np.count_nonzero(arr))
-    return {
-        "shape": list(arr.shape),
-        "dtype": str(arr.dtype),
-        "size": size,
-        "nonzero": nonzero,
-        "nz_ratio": float(nonzero / float(size)),
-        "l2": float(np.linalg.norm(arr64.ravel())),
-        "abs_max": float(np.max(np.abs(arr64))),
-        "mean": float(np.mean(arr64)),
-    }
 
 
 # ============================================================================
@@ -151,7 +120,7 @@ class TRTRunner:
 
         stream = torch.cuda.current_stream().cuda_stream
         self.context.execute_async_v3(stream_handle=stream)
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()  # Removed for async throughput profiling
         return [outputs[name] for name in self.output_names]
 
 
@@ -884,14 +853,16 @@ class StandaloneBEVFusion(nn.Module):
         self.voxelize_reduce = voxelize_reduce
         self.logger = logger
         self.use_tv_lidar = use_tv_lidar
-        self._tv_lidar_warmed = False
-        self._last_intermediates = {}
+        self._forward_count = 0
 
     @torch.no_grad()
     def forward_single(self, img, points, camera2ego, lidar2ego, lidar2camera,
                        lidar2image, camera_intrinsics, camera2lidar,
                        img_aug_matrix, lidar_aug_matrix, metas, **kwargs):
-        self._last_intermediates = {}
+        self._forward_count += 1
+        _t0 = time.time()
+        timings = {}
+
         B, N, C, H, W = img.shape
 
         # Step 1: SwinT backbone (TRT)
@@ -905,6 +876,7 @@ class StandaloneBEVFusion(nn.Module):
         for s in range(num_scales):
             feat = torch.cat([swin_outputs[i][s] for i in range(B * N)], dim=0)
             multi_scale_feats.append(feat)
+        _t1 = time.time(); timings['swin'] = (_t1 - _t0) * 1000.0; _t0 = _t1
 
         # Step 2: Camera neck (TRT)
         neck_out = self.neck_trt(
@@ -912,6 +884,7 @@ class StandaloneBEVFusion(nn.Module):
             multi_scale_feats[1].float(),
             multi_scale_feats[2].float())
         x_cam = neck_out[0].float()
+        _t1 = time.time(); timings['neck'] = (_t1 - _t0) * 1000.0; _t0 = _t1
 
         # Step 3: vtransform depthnet (TRT) + bev_pool_v2
         BN, C_neck, fH, fW = x_cam.shape
@@ -959,33 +932,10 @@ class StandaloneBEVFusion(nn.Module):
         # Apply BEV downsample (Conv2d stride=2)
         if self.bev_downsample is not None:
             camera_bev = self.bev_downsample(camera_bev)
-        self._last_intermediates["camera_bev"] = camera_bev.detach().cpu().numpy().copy()
+        _t1 = time.time(); timings['vtransform'] = (_t1 - _t0) * 1000.0; _t0 = _t1
 
         # Step 4: LiDAR backbone (spconv 2.3)
         feats, coords, sizes = self._voxelize(points)
-        if self.use_tv_lidar and coords.numel() > 0:
-            coords_np_sort = coords.detach().cpu().numpy().astype(np.int32, copy=False)
-            order = np.lexsort(
-                (coords_np_sort[:, 3], coords_np_sort[:, 2], coords_np_sort[:, 1], coords_np_sort[:, 0])
-            )
-            order_t = torch.from_numpy(order).to(device=feats.device, dtype=torch.long)
-            feats = feats.index_select(0, order_t).contiguous()
-            coords = coords.index_select(0, order_t).contiguous()
-            sizes = sizes.index_select(0, order_t).contiguous()
-        batch_size = int(coords[-1, 0].item()) + 1 if coords.numel() > 0 else 0
-        coords_np = coords.detach().cpu().numpy().astype(np.int32, copy=False)
-        feats_np = feats.detach().cpu().numpy().astype(np.float32, copy=False)
-        self._last_intermediates["lidar_voxel_stats"] = {
-            "batch_size": int(batch_size),
-            "num_voxels": int(feats.shape[0]),
-            "num_points_per_voxel": _summarize_tensor(sizes),
-            "voxel_features": _summarize_tensor(feats),
-            "coords": _summarize_tensor(coords_np),
-            "coords_md5": hashlib.md5(coords_np.tobytes()).hexdigest(),
-            "features_md5": hashlib.md5(feats_np.tobytes()).hexdigest(),
-        }
-        self._last_intermediates["lidar_voxel_features"] = feats_np.copy()
-        self._last_intermediates["lidar_voxel_coords"] = coords_np.copy()
 
         if self.use_tv_lidar:
             # TV mode: convert torch → tv.Tensor, run TV backbone, convert back
@@ -996,41 +946,10 @@ class StandaloneBEVFusion(nn.Module):
             feats_tv = tv.from_blob(feats_fp16.data_ptr(),
                                     list(feats_fp16.shape), tv.float16, 0)
             coords_np = coords.cpu().numpy().astype(np.int32)
-            coords_i32 = torch.from_numpy(coords_np).cuda().contiguous()
-            coords_tv = tv.from_blob(coords_i32.data_ptr(),
-                                     list(coords_i32.shape), tv.int32, 0)
+            coords_tv = tv.from_numpy(coords_np).cuda()
             batch_size = int(coords[-1, 0].item()) + 1
-
-            def _run_tv_lidar():
-                try:
-                    return self.lidar_backbone.forward(
-                        feats_tv, coords_tv, batch_size,
-                        feature_ref=feats_fp16, coors_ref=coords_i32)
-                except TypeError:
-                    return self.lidar_backbone.forward(
-                        feats_tv, coords_tv, batch_size,
-                        feature_ref=feats_fp16, coors_ref=coords_i32)
-
-            lidar_bev_np = None
-            candidate_stats = []
-            selected_try = -1
-            for retry_idx in range(4):
-                candidate = _run_tv_lidar()
-                lidar_bev_np = candidate
-                stats = _summarize_tensor(candidate)
-                stats["retry"] = int(retry_idx)
-                candidate_stats.append(stats)
-                if stats["nz_ratio"] > 0.02:
-                    selected_try = retry_idx
-                    break
-            if selected_try < 0:
-                selected_try = len(candidate_stats) - 1
-            self._last_intermediates["lidar_tv_diag"] = {
-                "mode": "tv",
-                "selected_try": int(selected_try),
-                "candidates": candidate_stats,
-            }
-            self._tv_lidar_warmed = True
+            lidar_bev_np = self.lidar_backbone.forward(
+                feats_tv, coords_tv, batch_size, feature_ref=feats_fp16)
             lidar_bev = torch.from_numpy(lidar_bev_np).cuda()
         else:
             # PyTorch mode
@@ -1038,17 +957,12 @@ class StandaloneBEVFusion(nn.Module):
             feats = feats.to(backbone_dtype)
             batch_size = coords[-1, 0] + 1
             lidar_bev = self.lidar_backbone(feats, coords, batch_size, sizes=sizes)
-            self._last_intermediates["lidar_tv_diag"] = {
-                "mode": "torch",
-                "selected_try": 0,
-                "candidates": [_summarize_tensor(lidar_bev)],
-            }
-        self._last_intermediates["lidar_bev"] = lidar_bev.detach().cpu().numpy().copy()
+        _t1 = time.time(); timings['lidar'] = (_t1 - _t0) * 1000.0; _t0 = _t1
 
         # Step 5: Fuser + Decoder (TRT)
         fuser_out = self.fuser_trt(camera_bev.float(), lidar_bev.float())
         neck_features = fuser_out[0].float()
-        self._last_intermediates["neck_features"] = neck_features.detach().cpu().numpy().copy()
+        _t1 = time.time(); timings['fuser'] = (_t1 - _t0) * 1000.0; _t0 = _t1
 
         # Step 6: TransFusionHead (TRT) + post-processing
         batch_size_int = img.shape[0]
@@ -1062,13 +976,7 @@ class StandaloneBEVFusion(nn.Module):
         vel = head_outs[4].float()
         heatmap = head_outs[5].float()
         query_heatmap_score = head_outs[6].float()
-        self._last_intermediates["center"] = center.detach().cpu().numpy().copy()
-        self._last_intermediates["height"] = height.detach().cpu().numpy().copy()
-        self._last_intermediates["dim"] = dim.detach().cpu().numpy().copy()
-        self._last_intermediates["rot"] = rot.detach().cpu().numpy().copy()
-        self._last_intermediates["vel"] = vel.detach().cpu().numpy().copy()
-        self._last_intermediates["heatmap"] = heatmap.detach().cpu().numpy().copy()
-        self._last_intermediates["query_heatmap_score"] = query_heatmap_score.detach().cpu().numpy().copy()
+        _t1 = time.time(); timings['head'] = (_t1 - _t0) * 1000.0; _t0 = _t1
 
         bboxes = self._decode_and_nms(
             center, height, dim, rot, vel, heatmap, query_heatmap_score, metas)
@@ -1078,6 +986,12 @@ class StandaloneBEVFusion(nn.Module):
                 "scores_3d": scores.cpu(),
                 "labels_3d": labels.cpu(),
             })
+        _t1 = time.time(); timings['decode_nms'] = (_t1 - _t0) * 1000.0
+
+        if self._forward_count % 100 == 1:
+            prof_str = " | ".join(f"{k}={v:.1f}ms" for k, v in timings.items())
+            self.logger.info(f"[Profile] {prof_str}")
+
         return outputs
 
     def _decode_and_nms(self, center, height, dim, rot, vel, heatmap,
@@ -1275,8 +1189,6 @@ def main():
                         help="LiDAR backbone quantization mode")
     parser.add_argument("--ptq-ckpt", default="pretrained/ptq_minmax_model.pth",
                         help="PTQ checkpoint for LiDAR quantization")
-    parser.add_argument("--lidar-npy-dir", default=None,
-                        help="LiDAR weights from .npy (zero-PyTorch). Overrides --ptq-ckpt for LiDAR")
     parser.add_argument("--test-single", action="store_true")
     parser.add_argument("--no-torch-lidar", action="store_true",
                         help="Use tv.Tensor LiDAR backbone (no PyTorch in backbone)")
@@ -1295,17 +1207,12 @@ def main():
     logger.info("Building LiDAR backbone (spconv 2.3)...")
 
     if args.no_torch_lidar:
-        from tools.tv_sparse_encoder import TVSparseEncoder, get_cuda_arch
+        from tools.tv_sparse_encoder_opt import TVSparseEncoder, get_cuda_arch
         arch = get_cuda_arch(0)
         logger.info(f"  TV mode (no PyTorch), arch={arch}")
         lidar_backbone = TVSparseEncoder(arch=arch, stream=0)
-        if args.lidar_npy_dir is not None:
-            logger.info(f"  TV Loading from .npy: {args.lidar_npy_dir}")
-            lidar_backbone.load_npy_weights(args.lidar_npy_dir)
-        elif args.lidar_quant != "none":
+        if args.lidar_quant != "none":
             logger.info(f"  TV Quantization mode: {args.lidar_quant}")
-            if args.lidar_quant == "w8a16":
-                logger.info("  W8A16: weight-only quant, activation FP (Log2 base will be skipped)")
             lidar_backbone.load_ptq_weights(args.ptq_ckpt)
         else:
             lidar_backbone.load_weights(args.ckpt)

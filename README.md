@@ -94,21 +94,16 @@ python tools/quant_ptq_minmax.py \
 - **[docs/HANDOFF_MASTER.md](docs/HANDOFF_MASTER.md)** — **总交接文档，单一入口**。包含完整 pipeline 架构、双环境说明、关键文件索引、血的教训、命令速查。若你是新接手的 Agent/开发者，**请先读此文档**。 
 
 ### 技术文档
-- **[docs/REPORT.md](docs/REPORT.md)** — 完整技术报告（量化原理、实现细节、实验结果）
+- **[docs/REPORT.md](docs/REPORT.md)** — 完整技术报告（量化原理、实现细节、实验结果、部署验证）
 - **[docs/RESULTS_LOG.md](docs/RESULTS_LOG.md)** — 实验结果时间线记录
-- **[docs/SERVER_DEPLOY.md](docs/SERVER_DEPLOY.md)** — 服务器部署手册（含所有 Round 命令）
-- **[docs/deploy_cmd.md](docs/deploy_cmd.md)** — 部署命令手册（所有冒烟测试和 NDS 评估命令）
-- **[docs/NEXT_PLAN.md](docs/NEXT_PLAN.md)** — 长期执行计划（Phase 9 Part B 及以后）
+- **[docs/SERVER_DEPLOY.md](docs/SERVER_DEPLOY.md)** — 服务器部署手册
+- **[docs/deploy_cmd.md](docs/deploy_cmd.md)** — 部署命令手册
+- **[docs/ablation.md](docs/ablation.md)** — 消融实验整理与可运行命令
 
 ### 归档文档
 - **[docs/MINI_DATASET_EXPERIMENTS_ARCHIVE.md](docs/MINI_DATASET_EXPERIMENTS_ARCHIVE.md)** — Mini 数据集实验归档
 - **[archive/resnet50_experiments/README.md](archive/resnet50_experiments/README.md)** — ResNet-50 替换实验归档
 
-### 清理记录
-- **[docs/CLEANUP_SUMMARY.md](docs/CLEANUP_SUMMARY.md)** — Mini 数据集清理总结
-- **[docs/RESNET50_CLEANUP_SUMMARY.md](docs/RESNET50_CLEANUP_SUMMARY.md)** — ResNet-50 实验整理总结
-- **[docs/TOOLS_CLEANUP_SUMMARY.md](docs/TOOLS_CLEANUP_SUMMARY.md)** — 工具清理总结
-- **[docs/DOCS_MERGE_SUMMARY.md](docs/DOCS_MERGE_SUMMARY.md)** — 文档合并总结
 
 ---
 
@@ -235,10 +230,10 @@ python tools/quant_ptq_minmax.py \
 
 ---
 
-**项目状态**：
-- ✅ **研究阶段**：8/8 全量化算法完成，精度损失仅 −2.7%（NDS 0.6875）
-- ✅ **部署阶段**：TV backbone 去 PyTorch + INT8 Log2 完成（NDS 0.6893）
-- ⏳ **后续**：Phase 9 Part B — 完全零 PyTorch（Jetson Orin），等待硬件到位
+**项目状态**：✅ 已完成
+- 8/8 全量化算法：精度损失 −2.7%（NDS 0.6875）
+- TRT 部署验证：Standalone TV INT8 Log2 NDS = 0.6893，部署体积 ~62.9 MB（压缩至 40%）
+- GPU Zero-Copy vtransform：4528 ms → 188.8 ms（−96%）
 
-**最后更新**：2026-04-08
+**最后更新**：2026-05-25
 **研究方向**：后量化研究 + TensorRT 边缘部署

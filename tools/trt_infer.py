@@ -169,6 +169,7 @@ class HybridBEVFusion(nn.Module):
             self._query_labels = None
 
         self.fp16_enabled = False
+        self._last_intermediates = {}
 
     @torch.no_grad()
     def forward_single(
@@ -288,6 +289,7 @@ class HybridBEVFusion(nn.Module):
             self.vtransform.downsample, nn.Identity
         ):
             camera_bev = self.vtransform.downsample(camera_bev)
+        self._last_intermediates['camera_bev'] = camera_bev.detach().cpu().numpy()
 
         # ============================================================
         # Step 4: LiDAR backbone (PyTorch)
@@ -296,6 +298,7 @@ class HybridBEVFusion(nn.Module):
         batch_size = coords[-1, 0] + 1
         lidar_bev = self.lidar_backbone(feats, coords, batch_size, sizes=sizes)
         # lidar_bev: [1, 256, 180, 180]
+        self._last_intermediates['lidar_bev'] = lidar_bev.detach().cpu().numpy()
 
         # ============================================================
         # Step 5: Fuser + Decoder (TRT)
@@ -303,6 +306,7 @@ class HybridBEVFusion(nn.Module):
         fuser_out = self.fuser_trt(camera_bev.float(), lidar_bev.float())
         neck_features = fuser_out[0].float()
         # neck_features: [1, 512, 180, 180]
+        self._last_intermediates['neck_features'] = neck_features.detach().cpu().numpy()
 
         # ============================================================
         # Step 6: TransFusionHead (TRT or PyTorch)
@@ -321,6 +325,13 @@ class HybridBEVFusion(nn.Module):
             vel = head_outs[4].float()
             heatmap = head_outs[5].float()
             query_heatmap_score = head_outs[6].float()
+            self._last_intermediates['center'] = center.detach().cpu().numpy()
+            self._last_intermediates['height'] = height.detach().cpu().numpy()
+            self._last_intermediates['dim'] = dim.detach().cpu().numpy()
+            self._last_intermediates['rot'] = rot.detach().cpu().numpy()
+            self._last_intermediates['vel'] = vel.detach().cpu().numpy()
+            self._last_intermediates['heatmap'] = heatmap.detach().cpu().numpy()
+            self._last_intermediates['query_heatmap_score'] = query_heatmap_score.detach().cpu().numpy()
 
             # Pure Python post-processing (decode + NMS)
             bboxes = self._decode_and_nms(

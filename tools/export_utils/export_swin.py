@@ -3,6 +3,7 @@ Phase 1: 导出 SwinTransformer 为 swin_int8.onnx
 
 运行: python tools/export_utils/export_swin.py 2>&1 | tee logs/export_swin.log
 """
+import argparse
 import sys, os, logging
 sys.path.insert(0, os.getcwd())
 
@@ -91,6 +92,11 @@ from mmdet3d.utils import get_root_logger, recursive_eval
 from mqbench.utils.state import enable_quantization
 from tools.quant_ptq_minmax import build_ptq_model
 
+parser = argparse.ArgumentParser(description="Export quantized Swin ONNX")
+parser.add_argument("--batch-size", type=int, default=1, help="Static export batch size")
+parser.add_argument("--output", type=str, default="swin_int8.onnx", help="ONNX output path")
+args = parser.parse_args()
+
 config_path = (
     "configs/nuscenes/det/transfusion/secfpn/camera+lidar/"
     "swint_v0p075/convfuser.yaml"
@@ -128,7 +134,7 @@ model.eval()
 swint = model.encoders.camera.backbone
 swint.eval()
 
-dummy = torch.randn(1, 3, 256, 704)
+dummy = torch.randn(args.batch_size, 3, 256, 704)
 
 fq_count = sum(1 for m in swint.modules()
                if 'FakeQuant' in type(m).__name__ or 'fake_quant' in type(m).__name__.lower())
@@ -143,7 +149,7 @@ else:
 
 try:
     torch.onnx.export(
-        swint, dummy, "swin_int8.onnx",
+        swint, dummy, args.output,
         opset_version=13,
         do_constant_folding=True,
         input_names=["image"],
@@ -154,12 +160,12 @@ try:
     )
 except torch.onnx.utils.ONNXCheckerError as e:
     print(f"[注意] ONNX checker 报错（忽略）: {e}")
-    if not os.path.exists("swin_int8.onnx"):
+    if not os.path.exists(args.output):
         raise
 
-print(f"文件大小: {os.path.getsize('swin_int8.onnx')/1024/1024:.1f} MB")
+print(f"文件大小: {os.path.getsize(args.output)/1024/1024:.1f} MB")
 
-m = onnx.load("swin_int8.onnx")
+m = onnx.load(args.output)
 qdq = [n for n in m.graph.node
        if n.op_type in ("QuantizeLinear","DequantizeLinear")]
 fq  = [n for n in m.graph.node
